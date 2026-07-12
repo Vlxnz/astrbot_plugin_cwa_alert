@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>中央氣象署警報播報</title>
+    <link rel="stylesheet" href="./style.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="topbar-title">
+        <h1>中央氣象署警報播報</h1>
+        <span id="connection-state" class="status-pill status-neutral">載入中</span>
+      </div>
+      <div class="topbar-actions">
+        <button id="refresh-button" class="button button-secondary" type="button">重新整理</button>
+        <button id="save-button" class="button button-primary" type="button">儲存設定</button>
+      </div>
+    </header>
+
+    <main class="workspace" aria-live="polite">
+      <section class="status-strip" aria-label="服務狀態">
+        <div class="status-item">
+          <span class="status-label">服務狀態</span>
+          <strong id="service-state">--</strong>
+        </div>
+        <div class="status-item">
+          <span class="status-label">目前來源</span>
+          <strong id="active-source">--</strong>
+        </div>
+        <div class="status-item">
+          <span class="status-label">已登記群組</span>
+          <strong id="target-count">0</strong>
+        </div>
+        <div class="status-item">
+          <span class="status-label">啟用規則</span>
+          <strong id="subscription-count">0</strong>
+        </div>
+        <div class="status-item status-item-wide">
+          <span class="status-label">最近來源狀態</span>
+          <strong id="source-summary">--</strong>
+        </div>
+      </section>
+
+      <div id="page-error" class="notice notice-error" role="alert" hidden></div>
+
+      <div class="operations-grid">
+        <div class="operations-main">
+          <section class="panel" aria-labelledby="global-heading">
+            <div class="panel-heading">
+              <div>
+                <h2 id="global-heading">全域設定</h2>
+                <span id="revision-label" class="metadata-text">版本 --</span>
+              </div>
+            </div>
+            <div class="form-grid form-grid-global">
+              <label class="field field-inline">
+                <span>啟用自動播報</span>
+                <input id="enabled-input" type="checkbox" role="switch">
+              </label>
+              <label class="field">
+                <span>資料來源</span>
+                <select id="source-mode-input">
+                  <option value="auto">自動（API 優先，RSS 降級）</option>
+                  <option value="api">僅開放資料 API</option>
+                  <option value="rss">僅官方 RSS</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>輪詢間隔（秒）</span>
+                <input id="poll-interval-input" type="number" min="60" max="600" step="30" inputmode="numeric">
+              </label>
+              <label class="field field-api-key">
+                <span>API 授權碼（選填）</span>
+                <input id="api-key-input" type="password" autocomplete="off" spellcheck="false">
+                <small id="api-key-state">未設定</small>
+              </label>
+              <label class="field field-inline field-clear-key">
+                <span>清除既有授權碼</span>
+                <input id="clear-api-key-input" type="checkbox">
+              </label>
+            </div>
+          </section>
+
+          <section class="panel" aria-labelledby="rules-heading">
+            <div class="panel-heading">
+              <div>
+                <h2 id="rules-heading">訂閱規則</h2>
+                <span id="rules-summary" class="metadata-text">0 筆</span>
+              </div>
+              <button id="add-rule-button" class="button button-secondary" type="button">新增規則</button>
+            </div>
+            <div id="rules-container" class="rules-list"></div>
+          </section>
+        </div>
+
+        <aside class="operations-aside">
+          <section class="panel" aria-labelledby="source-test-heading">
+            <div class="panel-heading">
+              <h2 id="source-test-heading">資料來源</h2>
+            </div>
+            <div class="compact-row">
+              <label class="field field-grow">
+                <span>測試來源</span>
+                <select id="source-test-input">
+                  <option value="current">目前設定</option>
+                  <option value="api">開放資料 API</option>
+                  <option value="rss">官方 RSS</option>
+                </select>
+              </label>
+              <button id="source-test-button" class="button button-secondary align-end" type="button">測試</button>
+            </div>
+            <dl id="source-detail" class="detail-list"></dl>
+            <div id="source-test-result" class="inline-result" hidden></div>
+          </section>
+
+          <section class="panel" aria-labelledby="targets-heading">
+            <div class="panel-heading">
+              <div>
+                <h2 id="targets-heading">群組目標</h2>
+                <span id="targets-summary" class="metadata-text">0 個</span>
+              </div>
+            </div>
+            <div id="targets-container" class="targets-list"></div>
+          </section>
+        </aside>
+      </div>
+
+      <section class="panel delivery-panel" aria-labelledby="delivery-heading">
+        <div class="panel-heading">
+          <div>
+            <h2 id="delivery-heading">傳送紀錄</h2>
+            <span id="delivery-summary" class="metadata-text">尚無紀錄</span>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>時間</th>
+                <th>目標</th>
+                <th>內容</th>
+                <th>狀態</th>
+                <th>嘗試</th>
+                <th>錯誤</th>
+              </tr>
+            </thead>
+            <tbody id="delivery-body"></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+
+    <dialog id="confirm-dialog" class="dialog dialog-confirm">
+      <form method="dialog">
+        <h2 id="confirm-title">確認操作</h2>
+        <p id="confirm-message"></p>
+        <div class="dialog-actions">
+          <button id="confirm-cancel" class="button button-secondary" value="cancel">取消</button>
+          <button id="confirm-accept" class="button button-danger" value="confirm">確認</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="preview-dialog" class="dialog dialog-preview">
+      <div class="dialog-preview-header">
+        <div>
+          <h2 id="preview-title">訊息預覽</h2>
+          <span id="preview-meta" class="metadata-text"></span>
+        </div>
+        <button id="preview-close" class="icon-button" type="button" aria-label="關閉">×</button>
+      </div>
+      <div id="preview-content" class="preview-content"></div>
+    </dialog>
+
+    <div id="toast" class="toast" role="status" hidden></div>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

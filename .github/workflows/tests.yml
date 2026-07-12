@@ -1,0 +1,85 @@
+name: 測試
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 取出原始碼
+        uses: actions/checkout@v4
+
+      - name: 設定 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 安裝相依套件
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: 編譯原始碼
+        run: python -m compileall -q .
+
+      - name: 檢查管理頁 JavaScript
+        run: node --check pages/settings/app.js
+
+      - name: 執行離線單元測試
+        run: python -m unittest discover -s tests -v
+
+      - name: 驗證發布 ZIP 結構
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path, PurePosixPath
+          from tempfile import TemporaryDirectory
+          from zipfile import ZIP_DEFLATED, ZipFile
+
+          root = Path.cwd()
+          top_level = "astrbot_plugin_cwa_alert"
+          release_files = {
+              Path(".gitignore"),
+              Path("LICENSE"),
+              Path("README.md"),
+              Path("__init__.py"),
+              Path("cwa_client.py"),
+              Path("logo.png"),
+              Path("main.py"),
+              Path("metadata.yaml"),
+              Path("pages/settings/app.js"),
+              Path("pages/settings/index.html"),
+              Path("pages/settings/style.css"),
+              Path("requirements.txt"),
+              Path("service.py"),
+          }
+          missing = sorted(str(path) for path in release_files if not (root / path).is_file())
+          assert not missing, f"缺少發布檔案：{missing}"
+
+          with TemporaryDirectory() as temp_dir:
+              archive = Path(temp_dir) / f"{top_level}.zip"
+              with ZipFile(archive, "w", ZIP_DEFLATED) as output:
+                  for relative in sorted(release_files):
+                      output.write(
+                          root / relative,
+                          (PurePosixPath(top_level) / relative.as_posix()).as_posix(),
+                      )
+
+              with ZipFile(archive) as packaged:
+                  names = packaged.namelist()
+              assert names, "發布 ZIP 不可為空"
+              assert {PurePosixPath(name).parts[0] for name in names} == {top_level}
+              assert all(not PurePosixPath(name).is_absolute() for name in names)
+              assert all(".." not in PurePosixPath(name).parts for name in names)
+              assert all("tests" not in PurePosixPath(name).parts for name in names)
+              assert all(".github" not in PurePosixPath(name).parts for name in names)
+              assert all("__pycache__" not in PurePosixPath(name).parts for name in names)
+              assert all(not name.endswith((".pyc", ".pyo")) for name in names)
+          PY
