@@ -2,7 +2,7 @@ name: astrbot_plugin_cwa_alert
 display_name: 中央氣象署警報播報
 short_desc: 跨平台播報臺灣天氣、地震、颱風與災害警特報。
 desc: 透過中央氣象署開放資料 API 與官方 RSS，向已登記群組播報天氣、地震、颱風、豪雨及其他災害警特報。
-version: 0.1.0
+version: 0.1.1
 author: Qiuxyi_0
 repo: "https://github.com/Vlxnz/astrbot_plugin_cwa_alert"
 astrbot_version: ">=4.26.0b10,<5"

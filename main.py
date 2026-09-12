@@ -755,12 +755,24 @@ class CWAAlertPlugin(star.Star):
                     target_umo, MessageChain().message(chunk).use_t2i(False)
                 )
                 if not sent:
-                    return False, "找不到目標所屬的平台實例。"
+                    error = "找不到目標所屬的平台實例。"
+                    logger.error(
+                        "中央氣象署主動文字播報未送出（目標=%s）：%s",
+                        target_umo,
+                        error,
+                    )
+                    return False, error
                 if index < len(chunks) - 1:
                     await asyncio.sleep(0.2)
             return True, None
         except Exception as exc:
-            return False, self._safe_error(exc)
+            error = self._safe_error(exc)
+            logger.error(
+                "中央氣象署主動文字播報失敗（目標=%s）：%s",
+                target_umo,
+                error,
+            )
+            return False, error
 
     async def _send_image(self, target_umo: str, path: Path) -> tuple[bool, str | None]:
         validation_error = self._validate_target_umo(target_umo)
@@ -770,9 +782,25 @@ class CWAAlertPlugin(star.Star):
             sent = await self.context.send_message(
                 target_umo, MessageChain().file_image(str(path)).use_t2i(False)
             )
-            return (True, None) if sent else (False, "找不到目標所屬的平台實例。")
+            if not sent:
+                error = "找不到目標所屬的平台實例。"
+                logger.error(
+                    "中央氣象署主動圖片播報未送出（目標=%s，檔案=%s）：%s",
+                    target_umo,
+                    path.name,
+                    error,
+                )
+                return False, error
+            return True, None
         except Exception as exc:
-            return False, self._safe_error(exc)
+            error = self._safe_error(exc)
+            logger.error(
+                "中央氣象署主動圖片播報失敗（目標=%s，檔案=%s）：%s",
+                target_umo,
+                path.name,
+                error,
+            )
+            return False, error
 
     def _validate_target_umo(
         self, target_umo: str, *, require_available: bool = True
