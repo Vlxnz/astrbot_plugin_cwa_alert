@@ -810,11 +810,11 @@ def format_weather_forecast(forecast: Any, *, max_periods: int = 3) -> str:
             time_range = _display_time(end)
         else:
             time_range = "預報時段未提供"
-        lines.append(f"\n{index}. {time_range}")
+        period_parts = [f"{index}. {time_range}"]
 
         weather = _value(period, "weather", "description", "wx", default=None)
         if weather not in (None, ""):
-            lines.append(f"天氣：{str(weather).strip()}")
+            period_parts.append(str(weather).strip())
         probability = _value(
             period,
             "rain_probability",
@@ -826,7 +826,7 @@ def format_weather_forecast(forecast: Any, *, max_periods: int = 3) -> str:
             probability_text = str(probability).strip()
             if not probability_text.endswith("%"):
                 probability_text += "%"
-            lines.append(f"降雨機率：{probability_text}")
+            period_parts.append(f"降雨 {probability_text}")
         minimum = _value(
             period, "min_temperature", "min_temp", "minimum_temperature", default=None
         )
@@ -836,17 +836,17 @@ def format_weather_forecast(forecast: Any, *, max_periods: int = 3) -> str:
         if minimum not in (None, "") or maximum not in (None, ""):
             minimum_text = str(minimum).strip() if minimum not in (None, "") else "—"
             maximum_text = str(maximum).strip() if maximum not in (None, "") else "—"
-            lines.append(f"溫度：{minimum_text}～{maximum_text} °C")
+            period_parts.append(f"{minimum_text}～{maximum_text} °C")
         comfort = _value(period, "comfort", "comfort_index", "ci", default=None)
         if comfort not in (None, ""):
-            lines.append(f"舒適度：{str(comfort).strip()}")
+            period_parts.append(f"舒適度 {str(comfort).strip()}")
+        lines.append("｜".join(period_parts))
 
     if not periods:
         lines.append("目前沒有可顯示的預報時段。")
     link = _value(forecast, "link", "url", default=None)
     if link:
         lines.append(f"\n官方連結：{_clean_url(str(link))}")
-    lines.append("資料來源：交通部中央氣象署")
     return "\n".join(lines)
 
 
@@ -868,7 +868,9 @@ def format_alert_event(event: Any) -> str:
     lines = [heading]
     title = _value(event, "title", "headline", default=None)
     if title:
-        lines.append(str(title).strip())
+        title_text = str(title).strip()
+        if title_text != label:
+            lines.append(title_text)
 
     bulletin = _value(event, "bulletin_no", "report_no", "serial_no", default=None)
     if bulletin:
@@ -882,13 +884,6 @@ def format_alert_event(event: Any) -> str:
     )
     if published:
         lines.append(f"發布時間：{_display_time(published)}")
-    effective = _value(event, "effective_at", "effective_time", default=None)
-    if effective:
-        lines.append(f"生效時間：{_display_time(effective)}")
-    expires = _value(event, "expires_at", "expire_time", default=None)
-    if expires:
-        lines.append(f"到期時間：{_display_time(expires)}")
-
     areas = _event_areas(event)
     if areas:
         lines.append(f"影響區域：{'、'.join(areas)}")
@@ -905,7 +900,6 @@ def format_alert_event(event: Any) -> str:
     link = _value(event, "link", "url", default=None)
     if link:
         lines.append(f"\n官方連結：{_clean_url(str(link))}")
-    lines.append("資料來源：交通部中央氣象署")
     return "\n".join(lines)
 
 

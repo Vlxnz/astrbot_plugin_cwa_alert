@@ -1033,7 +1033,7 @@ class CWAClient:
                 trust_env=True,
                 headers={
                     "Accept-Encoding": "gzip, deflate",
-                    "User-Agent": "astrbot-plugin-cwa-alert/0.1.0",
+                    "User-Agent": "astrbot-plugin-cwa-alert/0.1.2",
                 },
             )
         if self._session.closed:
