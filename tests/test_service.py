@@ -363,6 +363,8 @@ class EventTests(unittest.TestCase):
                 "title": "海上陸上颱風警報",
                 "bulletin_no": "第 9 報",
                 "published_at": "2026-07-12T00:30:00Z",
+                "effective_at": "2026-07-12T00:30:00Z",
+                "expires_at": "2026-07-12T04:30:00Z",
                 "areas": ["臺北市", "新北市"],
                 "description": "請嚴加戒備。",
                 "link": "https://www.cwa.gov.tw/warning?id=secret#top",
@@ -374,7 +376,16 @@ class EventTests(unittest.TestCase):
         self.assertIn("影響區域：臺北市、新北市", text)
         self.assertIn("https://www.cwa.gov.tw/warning", text)
         self.assertNotIn("secret", text)
-        self.assertTrue(text.endswith("資料來源：交通部中央氣象署"))
+        self.assertNotIn("生效時間：", text)
+        self.assertNotIn("到期時間：", text)
+        self.assertNotIn("資料來源：", text)
+
+    def test_alert_formatter_omits_redundant_category_title(self) -> None:
+        text = service.format_alert_event(
+            {"category": "typhoon", "title": "颱風"}
+        )
+
+        self.assertEqual(text, "【中央氣象署｜颱風】")
 
     def test_cancellation_formatter_is_explicit(self) -> None:
         text = service.format_alert_event(
@@ -452,10 +463,11 @@ class FormattingAndScheduleTests(unittest.TestCase):
         text = service.format_weather_forecast(forecast)
 
         self.assertIn("【臺北市 36 小時天氣預報】", text)
-        self.assertIn("降雨機率：40%", text)
-        self.assertIn("溫度：26～31 °C", text)
+        self.assertIn("降雨 40%", text)
+        self.assertIn("26～31 °C", text)
         self.assertIn("3. ", text)
         self.assertNotIn("4. ", text)
+        self.assertNotIn("資料來源：", text)
 
     def test_weather_formatter_handles_rss_label_without_end_time(self) -> None:
         forecast = {
