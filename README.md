@@ -4,6 +4,10 @@
 
 <h1 align="center">AstrBot 中央氣象署警報播報外掛</h1>
 
+<p align="center">
+  <a href="README.zh-CN.md">简体中文</a> · 繁體中文（預設）
+</p>
+
 將交通部中央氣象署發布的縣市天氣、地震、海嘯、颱風與其他災害警特報，主動傳送至經管理員明確登記的 AstrBot 群組。外掛使用完整 UMO（Unified Message Origin）識別目標，不綁定 QQ 或任何單一平台的私有介面。
 
 - 版本：`0.1.2`
