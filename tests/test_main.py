@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 TEST_PACKAGE = "cwa_alert_main_under_test"
@@ -291,6 +291,7 @@ def _install_astrbot_stubs() -> dict[str, types.ModuleType]:
     modules["astrbot.api.star"].Star = StubStar
     modules["astrbot.api.star"].Context = StubContext
     modules["astrbot.api"].star = modules["astrbot.api.star"]
+    modules["astrbot.api"].logger = Mock(spec=["warning", "error"])
     modules["astrbot.api.event"].AstrMessageEvent = StubEvent
     modules["astrbot.api.event"].filter = StubFilter()
     modules["astrbot.api.platform"].MessageType = StubMessageType
@@ -989,11 +990,12 @@ class ManualMediaTests(unittest.IsolatedAsyncioTestCase):
         with (
             tempfile.TemporaryDirectory() as temp_dir,
             patch.object(plugin, "_temp_directory", return_value=Path(temp_dir)),
-            self.assertLogs("astrbot", level="WARNING"),
+            patch.object(main.logger, "warning", new_callable=Mock) as warning,
         ):
             await plugin.cwa_media(event)
             self.assertEqual(list(Path(temp_dir).iterdir()), [])
 
+        warning.assert_called()
         plugin._client.fetch_api_alerts.assert_awaited_once_with(
             ("E-A0015-001", "E-A0016-001")
         )
@@ -1147,11 +1149,12 @@ class CombinedAlertTests(unittest.IsolatedAsyncioTestCase):
         with (
             tempfile.TemporaryDirectory() as temp_dir,
             patch.object(plugin, "_temp_directory", return_value=Path(temp_dir)),
-            self.assertLogs("astrbot", level="WARNING"),
+            patch.object(main.logger, "warning", new_callable=Mock) as warning,
         ):
             await plugin._dispatch_alert_events([event], baseline_only=False)
             await plugin._dispatch_alert_events([event], baseline_only=False)
 
+        warning.assert_called()
         media.assert_awaited_once()
         self.assertEqual(len(context.sent), 1)
         self.assertEqual([kind for kind, _ in context.sent[0][1].parts], ["text"])
@@ -1165,7 +1168,7 @@ class CombinedAlertTests(unittest.IsolatedAsyncioTestCase):
         context.send_results = [RuntimeError("平台拒絕圖片"), True]
         plugin = main.CWAAlertPlugin(context)
         mixed = []
-        with self.assertLogs("astrbot", level="WARNING"):
+        with patch.object(main.logger, "warning", new_callable=Mock) as warning:
             succeeded, error = await plugin._deliver_text(
                 "event",
                 "qq:group:100",
@@ -1175,6 +1178,7 @@ class CombinedAlertTests(unittest.IsolatedAsyncioTestCase):
                 images=[Path("test.png")],
                 mixed=mixed,
             )
+        warning.assert_called()
         self.assertTrue(succeeded)
         self.assertIsNone(error)
         self.assertEqual(mixed, [(False, "平台拒絕圖片")])
@@ -1206,9 +1210,10 @@ class CombinedAlertTests(unittest.IsolatedAsyncioTestCase):
             tempfile.TemporaryDirectory() as temp_dir,
             patch.object(plugin, "_temp_directory", return_value=Path(temp_dir)),
             patch.object(main, "ALERT_MEDIA_TIMEOUT_SECONDS", 0.01),
-            self.assertLogs("astrbot", level="WARNING"),
+            patch.object(main.logger, "warning", new_callable=Mock) as warning,
         ):
             await plugin._dispatch_alert_events([event], baseline_only=False)
+        warning.assert_called()
         self.assertEqual(len(context.sent), 1)
         self.assertEqual(
             [kind for kind, _ in context.sent[0][1].parts], ["text", "image"]

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import logging
 import time
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
@@ -14,7 +13,7 @@ from tempfile import TemporaryDirectory
 from typing import Any
 from uuid import uuid4
 
-from astrbot.api import star
+from astrbot.api import logger, star
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.platform import MessageType
 from astrbot.api.web import error_response, json_response, request
@@ -36,8 +35,6 @@ from .cwa_client import (
     CWAClientError,
     WeatherForecast,
 )
-
-logger = logging.getLogger("astrbot")
 
 PLUGIN_NAME = "astrbot_plugin_cwa_alert"
 SETTINGS_KEY = "settings_v1"
