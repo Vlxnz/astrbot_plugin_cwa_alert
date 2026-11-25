@@ -375,15 +375,15 @@ class EventTests(unittest.TestCase):
         self.assertIn("2026/07/12 08:30", text)
         self.assertIn("影響區域：臺北市、新北市", text)
         self.assertIn("https://www.cwa.gov.tw/warning", text)
+        self.assertEqual(text.splitlines()[-1], "https://www.cwa.gov.tw/warning")
+        self.assertNotIn("官方連結：", text)
         self.assertNotIn("secret", text)
         self.assertNotIn("生效時間：", text)
         self.assertNotIn("到期時間：", text)
         self.assertNotIn("資料來源：", text)
 
     def test_alert_formatter_omits_redundant_category_title(self) -> None:
-        text = service.format_alert_event(
-            {"category": "typhoon", "title": "颱風"}
-        )
+        text = service.format_alert_event({"category": "typhoon", "title": "颱風"})
 
         self.assertEqual(text, "【中央氣象署｜颱風】")
 

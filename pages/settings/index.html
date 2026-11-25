@@ -85,12 +85,24 @@
           <section class="panel" aria-labelledby="rules-heading">
             <div class="panel-heading">
               <div>
-                <h2 id="rules-heading">訂閱規則</h2>
-                <span id="rules-summary" class="metadata-text">0 筆</span>
+                <h2 id="rules-heading">群組播報</h2>
+                <span id="rules-summary" class="metadata-text"></span>
               </div>
-              <button id="add-rule-button" class="button button-secondary" type="button">新增規則</button>
+            </div>
+            <div class="list-controls">
+              <input id="group-search" type="search" aria-label="搜尋群組" placeholder="搜尋群名、平台或群組 ID">
+              <select id="group-filter" aria-label="依播報狀態篩選群組">
+                <option value="">所有播報狀態</option>
+                <option value="enabled">已啟用</option>
+                <option value="disabled">未啟用</option>
+              </select>
             </div>
             <div id="rules-container" class="rules-list"></div>
+            <nav id="group-pagination" class="pagination" aria-label="群組分頁" hidden>
+              <button id="group-previous" class="button button-secondary button-small" type="button">上一頁</button>
+              <span id="group-page-label" class="metadata-text"></span>
+              <button id="group-next" class="button button-secondary button-small" type="button">下一頁</button>
+            </nav>
           </section>
         </div>
 
@@ -113,16 +125,6 @@
             <dl id="source-detail" class="detail-list"></dl>
             <div id="source-test-result" class="inline-result" hidden></div>
           </section>
-
-          <section class="panel" aria-labelledby="targets-heading">
-            <div class="panel-heading">
-              <div>
-                <h2 id="targets-heading">群組目標</h2>
-                <span id="targets-summary" class="metadata-text">0 個</span>
-              </div>
-            </div>
-            <div id="targets-container" class="targets-list"></div>
-          </section>
         </aside>
       </div>
 
@@ -133,6 +135,23 @@
             <span id="delivery-summary" class="metadata-text">尚無紀錄</span>
           </div>
         </div>
+        <div class="list-controls">
+          <select id="delivery-group" aria-label="依群組篩選傳送紀錄">
+            <option value="">所有群組</option>
+          </select>
+          <select id="delivery-filter" aria-label="依狀態篩選傳送紀錄">
+            <option value="">所有傳送狀態</option>
+            <option value="success">成功</option>
+            <option value="failed">失敗</option>
+          </select>
+          <select id="delivery-kind" aria-label="依內容篩選傳送紀錄">
+            <option value="">所有內容</option>
+            <option value="weather">定時天氣</option>
+            <option value="alerts">災害警報</option>
+            <option value="media">官方圖資</option>
+            <option value="test">測試訊息</option>
+          </select>
+        </div>
         <div class="table-wrap">
           <table>
             <thead>
@@ -142,12 +161,17 @@
                 <th>內容</th>
                 <th>狀態</th>
                 <th>嘗試</th>
-                <th>錯誤</th>
+                <th>詳情</th>
               </tr>
             </thead>
             <tbody id="delivery-body"></tbody>
           </table>
         </div>
+        <nav id="delivery-pagination" class="pagination" aria-label="傳送紀錄分頁" hidden>
+          <button id="delivery-previous" class="button button-secondary button-small" type="button">上一頁</button>
+          <span id="delivery-page-label" class="metadata-text"></span>
+          <button id="delivery-next" class="button button-secondary button-small" type="button">下一頁</button>
+        </nav>
       </section>
     </main>
 

@@ -47,6 +47,20 @@ ALERT_DATASET_IDS = tuple(
 RSS_WARNING_URL = "https://www.cwa.gov.tw/rss/Data/cwa_warning.xml"
 RSS_FORECAST_URL_TEMPLATE = "https://www.cwa.gov.tw/rss/forecast/{code}.xml"
 TYPHOON_BULLETIN_URL = "https://www.cwa.gov.tw/Data/typhoon/I10.png"
+TYPHOON_STATE_URL = "https://www.cwa.gov.tw/Data/js/typhoon/TY_WARN-Data.js"
+STATIC_MEDIA = {
+    "typhoon_track": "https://www.cwa.gov.tw/Data/typhoon/TY_WARN/B20.png",
+    "typhoon_pdf": "https://www.cwa.gov.tw/Data/typhoon/TY_PDF.pdf",
+    "rain_warning_map": "https://www.cwa.gov.tw/Data/warning/W26_C.png",
+    "rain_forecast": "https://www.cwa.gov.tw/Data/fcst_img/QPF_ChFcstPrecip_12_12.png",
+}
+MEDIA_TYPES = {
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".pdf": "application/pdf",
+}
 
 MAX_XML_BYTES = 2 * 1024 * 1024
 MAX_JSON_BYTES = 4 * 1024 * 1024
@@ -248,6 +262,8 @@ class AlertEvent:
     official_id: str
     bulletin_no: str
     is_cancellation: bool
+    report_image: str = ""
+    shakemap_image: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -861,6 +877,14 @@ def normalize_api_alerts(
                 official_id=official_id,
                 bulletin_no=bulletin_no,
                 is_cancellation=bool(_CANCELLATION_PATTERN.search(combined)),
+                report_image=_find_first_value(record, ("ReportImageURI",))
+                if category
+                in {CATEGORY_SIGNIFICANT_EARTHQUAKE, CATEGORY_LOCAL_EARTHQUAKE}
+                else "",
+                shakemap_image=_find_first_value(record, ("ShakemapImageURI",))
+                if category
+                in {CATEGORY_SIGNIFICANT_EARTHQUAKE, CATEGORY_LOCAL_EARTHQUAKE}
+                else "",
             )
         )
     return tuple(events)
@@ -916,7 +940,7 @@ def _validate_cwa_data_url(url: str, source_kind: str) -> str:
 
     Args:
         url: Initial or redirected URL.
-        source_kind: Either ``api`` or ``rss``.
+        source_kind: One of ``api``, ``rss``, or ``media``.
 
     Returns:
         Normalized HTTPS URL without a fragment.
@@ -953,9 +977,33 @@ def _validate_cwa_data_url(url: str, source_kind: str) -> str:
         if hostname != "www.cwa.gov.tw" or parsed.path not in allowed_paths:
             raise CWASecurityError("RSS 重新導向離開允許的主機或頻道。")
         netloc = "www.cwa.gov.tw"
+    elif source_kind == "media":
+        canonical = urlunsplit(("https", hostname, parsed.path, "", ""))
+        earthquake_image = hostname == "scweb.cwa.gov.tw" and re.fullmatch(
+            r"/webdata/(?:OLDEQ/\d{6}/(?:[A-Z]{2})?\d{12,25}(?:_[A-Z])?|"
+            r"drawTrace/plotContour/\d{4}/\d{6,20}i)\.(?:png|gif|jpe?g)",
+            parsed.path,
+            re.IGNORECASE,
+        )
+        if (
+            canonical != TYPHOON_STATE_URL
+            and canonical != TYPHOON_BULLETIN_URL
+            and canonical not in STATIC_MEDIA.values()
+            and not earthquake_image
+        ):
+            raise CWASecurityError("官方圖資網址不在允許清單內。")
+        netloc = hostname
     else:
         raise ValueError(f"不支援的中央氣象署資料來源種類：{source_kind}")
-    return urlunsplit(("https", netloc, parsed.path, parsed.query, ""))
+    return urlunsplit(
+        (
+            "https",
+            netloc,
+            parsed.path,
+            "" if source_kind == "media" else parsed.query,
+            "",
+        )
+    )
 
 
 def build_cwa_ssl_context() -> ssl.SSLContext:
@@ -1033,7 +1081,7 @@ class CWAClient:
                 trust_env=True,
                 headers={
                     "Accept-Encoding": "gzip, deflate",
-                    "User-Agent": "astrbot-plugin-cwa-alert/0.1.2",
+                    "User-Agent": "astrbot-plugin-cwa-alert/0.1.5",
                 },
             )
         if self._session.closed:
@@ -1093,6 +1141,7 @@ class CWAClient:
         limit: int,
         accepted_types: tuple[str, ...],
         params: Mapping[str, str] | None = None,
+        modified_since: datetime | None = None,
     ) -> bytes:
         session = await self._ensure_session()
         last_error: BaseException | None = None
@@ -1137,6 +1186,10 @@ class CWAClient:
                             ):
                                 should_retry = True
                                 break
+                            if source_kind == "media":
+                                raise CWAHTTPError(
+                                    status, f"{source_label}回應 HTTP {status}。"
+                                )
                             self._raise_status(status, source_label)
                         content_type = self._content_type(response)
                         if content_type not in accepted_types:
@@ -1144,6 +1197,19 @@ class CWAClient:
                                 f"{source_label}回傳非預期的 Content-Type："
                                 f"{content_type or '未提供'}。"
                             )
+                        if modified_since is not None:
+                            try:
+                                modified = parsedate_to_datetime(
+                                    response.headers.get("Last-Modified", "")
+                                )
+                                if modified.tzinfo is None:
+                                    modified = modified.replace(tzinfo=timezone.utc)
+                            except (TypeError, ValueError, OverflowError):
+                                modified = None
+                            if modified is None or modified < modified_since:
+                                raise CWAClientError(
+                                    "官方圖資尚未更新至本次警報的發布時間。"
+                                )
                         return await self._read_limited(response, limit)
                 if should_retry:
                     await asyncio.sleep(0.5 * (2**attempt))
@@ -1294,6 +1360,105 @@ class CWAClient:
             "message": f"RSS 連線成功，目前頻道有 {len(items)} 筆項目。",
             "count": len(items),
         }
+
+    async def active_typhoon_issued_at(self) -> datetime | None:
+        """Read the issue time of the current active warning from CWA metadata.
+
+        Returns:
+            Taiwan-local issue time, or None when no warning is active.
+
+        Raises:
+            CWAClientError: The download or metadata parsing failed.
+        """
+        data = await self._request_bytes(
+            TYPHOON_STATE_URL,
+            source_kind="media",
+            source_label="中央氣象署颱風警報狀態",
+            limit=MAX_XML_BYTES,
+            accepted_types=(
+                "application/javascript",
+                "text/javascript",
+                "application/x-javascript",
+            ),
+            params={"_": str(int(datetime.now(timezone.utc).timestamp()))},
+        )
+        level = re.search(
+            rb"\bTY_WARN_Lv\s*=\s*\{\s*['\x22]ID['\x22]\s*:\s*['\x22]([A-Z]+)['\x22]",
+            data,
+        )
+        if not level or level[1] not in {b"SEA", b"LAND"}:
+            return None
+        issued = re.search(rb"\bFile_Time\s*=\s*['\x22](\d{12})['\x22]", data)
+        if issued is None:
+            raise CWAParseError("颱風警報狀態缺少發布時間。")
+        try:
+            return datetime.strptime(issued[1].decode("ascii"), "%Y%m%d%H%M")
+        except ValueError as exc:
+            raise CWAParseError("颱風警報狀態的發布時間無效。") from exc
+
+    async def download_official_media(
+        self,
+        url: str,
+        directory: Path,
+        filename: str,
+        *,
+        modified_since: datetime | None = None,
+    ) -> Path:
+        """Download a validated official image or PDF to an isolated directory.
+
+        Args:
+            url: Official source URL for the media.
+            directory: Temporary directory for this download.
+            filename: Application-defined name without the extension.
+            modified_since: Earliest acceptable modification time for rolling products.
+
+        Returns:
+            Local path of the validated media.
+
+        Raises:
+            CWAClientError: The asset could not be downloaded or validated.
+        """
+        safe_url = _validate_cwa_data_url(url, "media")
+        extension = Path(urlsplit(safe_url).path).suffix.lower()
+        content_type = MEDIA_TYPES.get(extension)
+        if not content_type:
+            raise CWASecurityError("此網址未提供可下載的圖片或 PDF。")
+        data = await self._request_bytes(
+            safe_url,
+            source_kind="media",
+            source_label="中央氣象署圖資",
+            limit=MAX_PNG_BYTES,
+            accepted_types=(content_type,),
+            params={"_": str(int(datetime.now(timezone.utc).timestamp()))},
+            modified_since=modified_since,
+        )
+        if content_type == "application/pdf":
+            if not data.startswith(b"%PDF-") or not data.rstrip().endswith(b"%%EOF"):
+                raise CWASecurityError("官方圖資不是有效的 PDF 檔案。")
+        else:
+            expected_format = {
+                "image/png": "PNG",
+                "image/gif": "GIF",
+                "image/jpeg": "JPEG",
+            }[content_type]
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("error", Image.DecompressionBombWarning)
+                    with Image.open(BytesIO(data), formats=[expected_format]) as image:
+                        image.verify()
+                    with Image.open(BytesIO(data), formats=[expected_format]) as image:
+                        image.load()
+            except (
+                OSError,
+                ValueError,
+                SyntaxError,
+                Image.DecompressionBombError,
+                Image.DecompressionBombWarning,
+            ) as exc:
+                raise CWASecurityError("官方圖資圖片解碼驗證失敗。") from exc
+        target = directory / f"{filename}{extension}"
+        target.write_bytes(data)
+        return target
 
     async def download_typhoon_bulletin(
         self,

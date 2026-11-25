@@ -8,6 +8,7 @@ import ssl
 import sys
 import tempfile
 import unittest
+from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -438,6 +439,10 @@ class APINormalizationTests(unittest.TestCase):
                         "ReportContent": "07月12日臺東縣發生規模5.1地震。",
                         "ReportTime": "2026-07-12 08:00:00",
                         "Web": "https://www.cwa.gov.tw/V8/C/E/EQ/EQ.html",
+                        "ReportImageURI": "https://scweb.cwa.gov.tw/webdata/OLDEQ/202611/EE2026112516471755081_H.png",
+                        "Intensity": {
+                            "ShakemapImageURI": "https://scweb.cwa.gov.tw/webdata/drawTrace/plotContour/2026/2026081i.png",
+                        },
                         "EarthquakeInfo": {"OriginTime": "2026-07-12 07:58:00"},
                     }
                 ]
@@ -451,6 +456,8 @@ class APINormalizationTests(unittest.TestCase):
         self.assertEqual(events[0].category, "significant_earthquake")
         self.assertEqual(events[0].areas, ("臺東縣",))
         self.assertEqual(events[0].effective_at, "2026-07-12 07:58:00")
+        self.assertTrue(events[0].report_image.endswith("EE2026112516471755081_H.png"))
+        self.assertTrue(events[0].shakemap_image.endswith("2026081i.png"))
 
     def test_warning_event_is_classified_and_extracts_areas(self) -> None:
         payload = {
@@ -834,6 +841,61 @@ class AsyncTransportTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(destination.with_name("bulletin.png.part").exists())
         self.assertEqual(len(session.requests), 1)
         self.assertFalse(session.requests[0][1]["allow_redirects"])
+
+    async def test_official_media_accepts_real_path_shapes_and_omits_credentials(
+        self,
+    ) -> None:
+        data = ImageSecurityTests.make_png()
+        session = FakeSession([FakeResponse(data, content_type="image/png")])
+        client = cwa.CWAClient(session=session, api_key="secret")
+        url = (
+            "https://scweb.cwa.gov.tw/webdata/OLDEQ/202611/EE2026112516471755081_H.png"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            saved = await client.download_official_media(
+                url + "?Authorization=discard", Path(temp_dir), "report"
+            )
+            self.assertEqual(saved.read_bytes(), data)
+        request_url, options = session.requests[0]
+        self.assertEqual(request_url, url)
+        self.assertEqual(set(options["params"]), {"_"})
+
+    async def test_media_rejects_stale_or_invalid_pdfs_and_untrusted_redirects(
+        self,
+    ) -> None:
+        published = datetime.fromisoformat("2026-11-25T12:00:00+08:00")
+        url = cwa.STATIC_MEDIA["typhoon_pdf"]
+        samples = (
+            FakeResponse(
+                b"%PDF-1.4\n%%EOF\n",
+                content_type="application/pdf",
+                headers={"Last-Modified": "Tue, 24 Nov 2026 00:00:00 GMT"},
+            ),
+            FakeResponse(
+                b"not a pdf",
+                content_type="application/pdf",
+                headers={"Last-Modified": "Wed, 25 Nov 2026 04:00:00 GMT"},
+            ),
+            FakeResponse(
+                status=302, headers={"Location": "https://example.com/file.pdf"}
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for response in samples:
+                session = FakeSession([response])
+                client = cwa.CWAClient(session=session)
+                with self.assertRaises(cwa.CWAClientError):
+                    await client.download_official_media(
+                        url, Path(temp_dir), "notice", modified_since=published
+                    )
+                self.assertEqual(len(session.requests), 1)
+                self.assertEqual(list(Path(temp_dir).iterdir()), [])
+
+    async def test_typhoon_metadata_treats_cancellation_as_inactive(self) -> None:
+        data = b"var File_Time = '202610241200'; var TY_WARN_Lv = {'ID':'END'};"
+        response = FakeResponse(data, content_type="application/javascript")
+        client = cwa.CWAClient(session=FakeSession([response]))
+        self.assertIsNone(await client.active_typhoon_issued_at())
 
     async def test_redirect_is_validated_before_second_request(self) -> None:
         redirect = FakeResponse(

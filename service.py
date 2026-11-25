@@ -57,6 +57,15 @@ ALERT_TYPE_LABELS = {
     "other": "其他天氣警報",
 }
 ALERT_TYPES = tuple(ALERT_TYPE_LABELS)
+MEDIA_LABELS = {
+    "typhoon_bulletin": "颱風警報單",
+    "typhoon_track": "颱風動態圖",
+    "typhoon_pdf": "颱風輔助說明（PDF）",
+    "earthquake_report": "地震報告圖（需 API）",
+    "earthquake_shakemap": "地震震度圖（需 API）",
+    "rain_warning_map": "豪大雨特報區域圖",
+    "rain_forecast": "12 小時定量降水預報圖",
+}
 NATIONAL_ALERT_TYPES = frozenset(
     {"significant_earthquake", "local_earthquake", "tsunami", "typhoon"}
 )
@@ -299,6 +308,14 @@ def normalize_subscription(raw: Mapping[str, Any]) -> dict[str, Any]:
         if alert_type not in alert_types:
             alert_types.append(alert_type)
 
+    media_types = raw.get(
+        "media_types", ["typhoon_bulletin"] if "typhoon" in alert_types else []
+    )
+    if not isinstance(media_types, (list, tuple)) or any(
+        not isinstance(value, str) or value not in MEDIA_LABELS for value in media_types
+    ):
+        raise ValidationError("官方圖資類型無效。")
+
     return {
         "id": subscription_id,
         "target_umo": target_umo,
@@ -307,6 +324,7 @@ def normalize_subscription(raw: Mapping[str, Any]) -> dict[str, Any]:
         "forecast_enabled": forecast_enabled,
         "forecast_times": forecast_times,
         "alert_types": alert_types,
+        "media_types": list(dict.fromkeys(media_types)),
     }
 
 
@@ -846,7 +864,7 @@ def format_weather_forecast(forecast: Any, *, max_periods: int = 3) -> str:
         lines.append("目前沒有可顯示的預報時段。")
     link = _value(forecast, "link", "url", default=None)
     if link:
-        lines.append(f"\n官方連結：{_clean_url(str(link))}")
+        lines.append(f"\n{_clean_url(str(link))}")
     return "\n".join(lines)
 
 
@@ -899,7 +917,7 @@ def format_alert_event(event: Any) -> str:
         lines.append(f"\n{str(description).strip()}")
     link = _value(event, "link", "url", default=None)
     if link:
-        lines.append(f"\n官方連結：{_clean_url(str(link))}")
+        lines.append(f"\n{_clean_url(str(link))}")
     return "\n".join(lines)
 
 
@@ -1200,8 +1218,8 @@ def delivery_key(event_fingerprint_value: str, target_umo: str, part: str) -> st
     Raises:
         ValidationError: The part is unsupported.
     """
-    if part not in {"text", "image"}:
-        raise ValidationError("傳送部分只支援 text 或 image。")
+    if part not in {"text", "image", *MEDIA_LABELS}:
+        raise ValidationError("傳送內容類型無效。")
     target_digest = hashlib.sha256(str(target_umo).encode("utf-8")).hexdigest()[:16]
     return f"{event_fingerprint_value}:{target_digest}:{part}"
 
@@ -1214,6 +1232,7 @@ def mark_delivery_status(
     part: str,
     succeeded: bool,
     error: str | None = None,
+    content: Mapping[str, Any] | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Record one text or image delivery attempt and prune state.
@@ -1225,6 +1244,7 @@ def mark_delivery_status(
         part: ``text`` or ``image``.
         succeeded: Whether AstrBot accepted the delivery.
         error: Optional sanitized failure summary.
+        content: Optional snapshot of the attempted delivery.
         now: Attempt time.
 
     Returns:
@@ -1253,10 +1273,17 @@ def mark_delivery_status(
         "part": part,
         "status": "success" if succeeded else "failed",
         "attempts": max(0, attempts) + 1,
+        "first_attempt_at": (
+            previous.get("first_attempt_at", timestamp)
+            if isinstance(previous, Mapping)
+            else timestamp
+        ),
         "last_attempt_at": timestamp,
         "delivered_at": delivered_at,
         "error": None if succeeded else str(error or "未知錯誤")[:500],
     }
+    if content is not None:
+        result[key]["content"] = dict(content)
     return prune_delivery_status(result, now=now)
 
 

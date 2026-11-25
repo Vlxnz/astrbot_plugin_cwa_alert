@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
 from collections.abc import Mapping, Sequence
@@ -9,20 +10,26 @@ from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
+from uuid import uuid4
 
 from astrbot.api import star
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.platform import MessageType
 from astrbot.api.web import error_response, json_response, request
+from astrbot.core.message.components import File
 from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.platform.message_session import MessageSession
 from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
 
 from . import service
 from .cwa_client import (
+    API_DATASETS,
     CATEGORY_LOCAL_EARTHQUAKE,
     CATEGORY_SIGNIFICANT_EARTHQUAKE,
+    STATIC_MEDIA,
+    TYPHOON_BULLETIN_URL,
     AlertEvent,
     CWAAlertBatchError,
     CWAClient,
@@ -38,6 +45,7 @@ GROUPS_KEY = "known_groups_v1"
 SOURCE_STATE_KEY = "source_state_v1"
 SEEN_EVENTS_KEY = "seen_events_v1"
 DELIVERY_STATUS_KEY = "delivery_status_v1"
+ALERT_MEDIA_TIMEOUT_SECONDS = 6
 
 
 class CWAAlertPlugin(star.Star):
@@ -59,6 +67,7 @@ class CWAAlertPlugin(star.Star):
         self._client: CWAClient | None = None
         self._poll_task: asyncio.Task[None] | None = None
         self._state_lock = asyncio.Lock()
+        self._manual_media_targets: set[str] = set()
         self._next_alert_poll_at = 0.0
         self._next_weather_attempt_at = 0.0
         self._started_at = datetime.now(service.TAIPEI_TIMEZONE)
@@ -73,6 +82,12 @@ class CWAAlertPlugin(star.Star):
             ("settings", self.page_save_settings, ["POST", "PUT"], "儲存氣象播報設定"),
             ("source/test", self.page_test_source, ["POST"], "測試中央氣象署資料來源"),
             ("preview", self.page_preview, ["POST"], "預覽氣象播報內容"),
+            (
+                "delivery/detail",
+                self.page_delivery_detail,
+                ["POST"],
+                "讀取傳送紀錄詳情",
+            ),
             ("test-send", self.page_test_send, ["POST"], "傳送群組測試訊息"),
             ("targets/delete", self.page_delete_target, ["POST"], "移除已登記群組"),
             (
@@ -102,6 +117,7 @@ class CWAAlertPlugin(star.Star):
         self._source_state = service.default_source_state()
         if isinstance(source_state, Mapping):
             self._source_state.update(dict(source_state))
+        self._source_state.pop("pending_typhoon_images", None)
         self._last_alert_poll_at = self._source_state.get("last_alert_poll_at")
         seen_events = await self.get_kv_data(SEEN_EVENTS_KEY, {})
         delivery_status = await self.get_kv_data(DELIVERY_STATUS_KEY, {})
@@ -139,7 +155,7 @@ class CWAAlertPlugin(star.Star):
                 )
         temp_dir = self._temp_directory()
         if temp_dir.exists():
-            for pattern in ("*.png", "*.part"):
+            for pattern in ("typhoon_*.png", "typhoon_*.part"):
                 for path in temp_dir.glob(pattern):
                     with suppress(OSError):
                         path.unlink()
@@ -170,7 +186,6 @@ class CWAAlertPlugin(star.Star):
         return Path(get_astrbot_temp_path()) / PLUGIN_NAME
 
     async def _persist_runtime_state(self) -> None:
-        self._prune_pending_typhoon_images()
         await self.put_kv_data(SOURCE_STATE_KEY, self._source_state)
         await self.put_kv_data(SEEN_EVENTS_KEY, self._seen_events)
         await self.put_kv_data(DELIVERY_STATUS_KEY, self._delivery_status)
@@ -179,7 +194,6 @@ class CWAAlertPlugin(star.Star):
         while True:
             try:
                 if self._settings.get("enabled"):
-                    await self._retry_pending_typhoon_images()
                     monotonic_now = time.monotonic()
                     if monotonic_now >= self._next_alert_poll_at:
                         interval = int(
@@ -345,6 +359,24 @@ class CWAAlertPlugin(star.Star):
         self, events: Sequence[AlertEvent], *, baseline_only: bool
     ) -> None:
         subscriptions = self._settings.get("subscriptions", [])
+        pending_media: dict[str, tuple[AlertEvent, str, list[Mapping[str, Any]]]] = {}
+        latest_typhoon_update = max(
+            (
+                timestamp
+                for event in events
+                if event.category == "typhoon"
+                and (
+                    event.is_cancellation
+                    or service.should_download_typhoon_bulletin(event)
+                )
+                and (
+                    timestamp := self._parse_datetime(
+                        event.published_at or event.effective_at
+                    )
+                )
+            ),
+            default=None,
+        )
         for event in events:
             fingerprint = service.event_fingerprint(event)
             existing = self._seen_events.get(fingerprint)
@@ -370,216 +402,307 @@ class CWAAlertPlugin(star.Star):
                 continue
             if self._event_is_expired(event) and not event.is_cancellation:
                 continue
+            if fingerprint in pending_media:
+                continue
 
             matching = service.filter_subscriptions(subscriptions, event)
-            delivered_targets: list[str] = []
+            scheduled = []
             message = service.format_alert_event(event)
             for subscription in matching:
-                target_umo = str(subscription.get("target_umo") or "")
-                if service.delivery_succeeded(
-                    self._delivery_status, fingerprint, target_umo, "text"
-                ):
-                    delivered_targets.append(target_umo)
+                target = subscription["target_umo"]
+                previous = self._delivery_status.get(
+                    service.delivery_key(fingerprint, target, "text"), {}
+                )
+                if previous.get("status") == "success":
                     continue
-                succeeded, error = await self._send_text(target_umo, message)
-                self._delivery_status = service.mark_delivery_status(
-                    self._delivery_status,
-                    event_fingerprint_value=fingerprint,
-                    target_umo=target_umo,
-                    part="text",
-                    succeeded=succeeded,
-                    error=error,
-                )
-                if succeeded:
-                    delivered_targets.append(target_umo)
-
-            if service.should_download_typhoon_bulletin(event) and delivered_targets:
-                await self._dispatch_typhoon_image(fingerprint, delivered_targets)
-
-    async def _dispatch_typhoon_image(
-        self,
-        fingerprint: str,
-        target_umos: Sequence[str],
-    ) -> None:
-        pending_state = self._source_state.get("pending_typhoon_images")
-        if not isinstance(pending_state, dict):
-            pending_state = {}
-            self._source_state["pending_typhoon_images"] = pending_state
-        stored_pending_record = pending_state.get(fingerprint)
-        pending_record = (
-            dict(stored_pending_record)
-            if isinstance(stored_pending_record, Mapping)
-            else {}
-        )
-        stored_targets = pending_record.get("target_umos")
-        known_targets = list(
-            dict.fromkeys(
-                [
-                    str(target)
-                    for target in (
-                        list(stored_targets)
-                        if isinstance(stored_targets, Sequence)
-                        and not isinstance(stored_targets, (str, bytes))
-                        else []
+                if (
+                    not event.is_cancellation
+                    and subscription.get("media_types")
+                    and event.category
+                    in {
+                        "typhoon",
+                        "rain",
+                        CATEGORY_SIGNIFICANT_EARTHQUAKE,
+                        CATEGORY_LOCAL_EARTHQUAKE,
+                    }
+                    and not (previous.get("content") or {}).get("accepted")
+                ):
+                    scheduled.append(subscription)
+                else:
+                    await self._deliver_text(
+                        fingerprint,
+                        target,
+                        message,
+                        event.title,
+                        kind=event.category,
+                        refresh=True,
                     )
-                    if str(target)
-                ]
-                + [str(target) for target in target_umos if str(target)]
-            )
-        )
-        pending_record["target_umos"] = known_targets
-        pending = [
-            target
-            for target in known_targets
-            if not service.delivery_succeeded(
-                self._delivery_status, fingerprint, target, "image"
-            )
-        ]
-        if not pending:
-            pending_state.pop(fingerprint, None)
-            return
-        if pending_record.get("expired_at"):
-            return
-        now = datetime.now(service.TAIPEI_TIMEZONE)
-        first_attempt = self._parse_datetime(pending_record.get("first_attempt_at"))
-        if first_attempt and now - first_attempt > timedelta(minutes=10):
-            pending_record["expired_at"] = now.isoformat(timespec="seconds")
-            pending_record["last_error"] = "警報單圖片在十分鐘內仍未更新或完成傳送。"
-            pending_state[fingerprint] = pending_record
-            with suppress(OSError):
-                (self._temp_directory() / f"typhoon_{fingerprint[:16]}.png").unlink(
-                    missing_ok=True
-                )
-            return
-        if not first_attempt:
-            pending_record["first_attempt_at"] = now.isoformat(timespec="seconds")
+            if scheduled:
+                pending_media[fingerprint] = (event, message, scheduled)
 
-        temp_dir = self._temp_directory()
-        temp_path = temp_dir / f"typhoon_{fingerprint[:16]}.png"
-        remove_temp = False
+        # Groups receiving text only do not wait on additional network requests.
+        for fingerprint, (event, message, scheduled) in pending_media.items():
+            selected = {kind for rule in scheduled for kind in rule["media_types"]}
+            directory = self._temp_directory()
+            try:
+                directory.mkdir(parents=True, exist_ok=True)
+                temp = TemporaryDirectory(dir=directory, prefix="media_")
+            except OSError as exc:
+                logger.warning(
+                    "無法建立中央氣象署圖資暫存目錄：%s", self._safe_error(exc)
+                )
+                for rule in scheduled:
+                    await self._deliver_text(
+                        fingerprint,
+                        rule["target_umo"],
+                        message,
+                        event.title,
+                        kind=event.category,
+                        refresh=True,
+                    )
+                continue
+            with temp:
+                media = await self._collect_alert_media(
+                    event, fingerprint, selected, Path(temp.name), latest_typhoon_update
+                )
+                for rule in scheduled:
+                    target = rule["target_umo"]
+                    chosen = {
+                        kind: result
+                        for kind, result in media.items()
+                        if kind in rule["media_types"]
+                    }
+                    images = [
+                        value
+                        for kind, (value, _) in chosen.items()
+                        if kind != "typhoon_pdf" and isinstance(value, Path)
+                    ]
+                    pdf, _ = chosen.get("typhoon_pdf", (None, None))
+                    pdf_url = STATIC_MEDIA["typhoon_pdf"] if pdf else None
+                    send_file = bool(pdf and self._can_send_pdf(target))
+                    mixed: list[tuple[bool, str | None]] = []
+                    _, error = await self._deliver_text(
+                        fingerprint,
+                        target,
+                        message,
+                        event.title,
+                        kind=event.category,
+                        images=images,
+                        mixed=mixed,
+                        refresh=True,
+                        pdf_url=None if send_file else pdf_url,
+                    )
+                    for kind, (value, download_error) in chosen.items():
+                        label = service.MEDIA_LABELS[kind]
+                        content: dict[str, Any] = {
+                            "title": label,
+                            "kind": event.category,
+                        }
+                        attachment_sent = False
+                        attachment_error = download_error
+                        if value and kind == "typhoon_pdf":
+                            text_key = service.delivery_key(fingerprint, target, "text")
+                            first_chunk_sent = bool(
+                                self._delivery_status.get(text_key, {})
+                                .get("content", {})
+                                .get("accepted")
+                            )
+                            if send_file and first_chunk_sent:
+                                (
+                                    attachment_sent,
+                                    attachment_error,
+                                ) = await self._send_pdf(target, value)
+                                content["media_name"] = value.name
+                                if not attachment_sent and pdf_url:
+                                    (
+                                        attachment_sent,
+                                        fallback_error,
+                                    ) = await self._send_text(target, pdf_url)
+                                    if attachment_sent:
+                                        content = {
+                                            "title": label,
+                                            "kind": event.category,
+                                            "chunks": [pdf_url],
+                                        }
+                                    else:
+                                        attachment_error = (
+                                            fallback_error or attachment_error
+                                        )
+                            elif send_file:
+                                attachment_error = error
+                            else:
+                                content["chunks"] = [pdf_url]
+                                attachment_sent = first_chunk_sent
+                                attachment_error = None if attachment_sent else error
+                        elif value:
+                            content["media_name"] = value.name
+                            attachment_sent, attachment_error = (
+                                mixed[0] if mixed else (False, error)
+                            )
+                        self._delivery_status = service.mark_delivery_status(
+                            self._delivery_status,
+                            event_fingerprint_value=fingerprint,
+                            target_umo=target,
+                            part=kind,
+                            succeeded=attachment_sent,
+                            error=attachment_error,
+                            content=content,
+                        )
+
+    async def _collect_alert_media(
+        self,
+        event: AlertEvent,
+        fingerprint: str,
+        selected: set[str],
+        directory: Path,
+        latest_typhoon_update: datetime | None,
+    ) -> dict[str, tuple[Path | None, str | None]]:
+        """Fetch the selected official attachments before the alert is sent.
+
+        Args:
+            event: Alert whose media may be attached.
+            fingerprint: Cross-source event identity.
+            selected: Union of requested media types across pending groups.
+            directory: Temporary attachment directory.
+            latest_typhoon_update: Most recent typhoon bulletin or cancellation in the batch.
+
+        Returns:
+            Per-type validated attachment path or error.
+        """
+        timestamp = self._parse_datetime(event.published_at or event.effective_at)
+        if event.category == "typhoon":
+            urls = {
+                "typhoon_bulletin": TYPHOON_BULLETIN_URL,
+                "typhoon_track": STATIC_MEDIA["typhoon_track"],
+                "typhoon_pdf": STATIC_MEDIA["typhoon_pdf"],
+            }
+        elif event.category == "rain":
+            urls = {
+                key: STATIC_MEDIA[key] for key in ("rain_warning_map", "rain_forecast")
+            }
+        else:
+            urls = {
+                "earthquake_report": event.report_image,
+                "earthquake_shakemap": event.shakemap_image,
+            }
+        urls = {kind: url for kind, url in urls.items() if kind in selected}
+        if not urls:
+            return {}
+        client = self._client_instance()
+
+        async def download(kind: str, url: str) -> tuple[Path | None, str | None]:
+            try:
+                if not url:
+                    raise CWAClientError("本次官方報告未提供此圖資。")
+                cutoff = None
+                if kind.startswith("typhoon_") or kind == "rain_warning_map":
+                    if not timestamp:
+                        raise CWAClientError("警報缺少發布時間，無法確認圖資是否更新。")
+                    cutoff = timestamp - timedelta(minutes=5)
+                elif kind == "rain_forecast":
+                    cutoff = datetime.now(timezone.utc) - timedelta(hours=12)
+                label = service.MEDIA_LABELS[kind].split("（", 1)[0]
+                path = await client.download_official_media(
+                    url, directory, label, modified_since=cutoff
+                )
+                if kind == "typhoon_bulletin":
+                    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                    last = self._source_state.get("last_typhoon_image_hash")
+                    record = self._seen_events.get(fingerprint, {})
+                    if digest == last and digest != record.get("typhoon_image_hash"):
+                        raise CWAClientError("中央氣象署警報單圖片尚未更新。")
+                    record["typhoon_image_hash"] = digest
+                    self._source_state["last_typhoon_image_hash"] = digest
+                return path, None
+            except Exception as exc:
+                error = self._safe_error(exc)
+                logger.warning("中央氣象署官方圖資處理失敗（類型=%s）：%s", kind, error)
+                return None, error
+
+        results: dict[str, tuple[Path | None, str | None]] = {}
+        tasks: dict[str, asyncio.Task[tuple[Path | None, str | None]]] = {}
+        # Bound the alert delay and keep successful attachments if another times out.
         try:
-            image = await self._client_instance().download_typhoon_bulletin(
-                temp_path,
-                cache_token=str(int(time.time())),
+            async with asyncio.timeout(ALERT_MEDIA_TIMEOUT_SECONDS):
+                if event.category == "typhoon":
+                    if (
+                        not timestamp
+                        or (latest_typhoon_update and timestamp < latest_typhoon_update)
+                        or not (
+                            service.should_download_typhoon_bulletin(event)
+                            or (event.source == "api" and event.title.strip() == "颱風")
+                        )
+                    ):
+                        return {}
+                    issued = await client.active_typhoon_issued_at()
+                    if not issued or abs(
+                        timestamp - issued.replace(tzinfo=service.TAIPEI_TIMEZONE)
+                    ) > timedelta(minutes=30):
+                        return dict.fromkeys(
+                            urls, (None, "官網沒有與本次警報相符的颱風圖資。")
+                        )
+                async with asyncio.TaskGroup() as group:
+                    for kind, url in urls.items():
+                        tasks[kind] = group.create_task(download(kind, url))
+        except (TimeoutError, CWAClientError) as exc:
+            error = (
+                "官方圖資查詢逾時。"
+                if isinstance(exc, TimeoutError)
+                else self._safe_error(exc)
             )
-            previous_hash = str(self._source_state.get("last_typhoon_image_hash") or "")
-            event_hash = str(pending_record.get("image_hash") or "")
-            if (
-                previous_hash
-                and image.sha256 == previous_hash
-                and event_hash != image.sha256
-            ):
-                pending_record["last_error"] = "中央氣象署警報單圖片尚未更新。"
-                pending_record["last_attempt_at"] = now.isoformat(timespec="seconds")
-                pending_state[fingerprint] = pending_record
-                remove_temp = True
-                return
+            logger.warning("中央氣象署警報圖資未全部取得：%s", error)
+            results = dict.fromkeys(urls, (None, error))
+        results.update(
+            (kind, task.result())
+            for kind, task in tasks.items()
+            if not task.cancelled()
+        )
+        return results
 
-            pending_record["image_hash"] = image.sha256
-            pending_record["last_attempt_at"] = now.isoformat(timespec="seconds")
-            all_succeeded = True
-            any_succeeded = False
-            for target_umo in pending:
-                succeeded, error = await self._send_image(target_umo, image.path)
-                self._delivery_status = service.mark_delivery_status(
-                    self._delivery_status,
-                    event_fingerprint_value=fingerprint,
-                    target_umo=target_umo,
-                    part="image",
-                    succeeded=succeeded,
-                    error=error,
-                )
-                all_succeeded = all_succeeded and succeeded
-                any_succeeded = any_succeeded or succeeded
-            if any_succeeded:
-                self._source_state["last_typhoon_image_hash"] = image.sha256
-            if all_succeeded:
-                pending_state.pop(fingerprint, None)
-                remove_temp = True
-            else:
-                pending_record["last_error"] = (
-                    "部分群組的警報單圖片傳送失敗，等待重試。"
-                )
-                pending_state[fingerprint] = pending_record
+    def _can_send_pdf(self, target_umo: str) -> bool:
+        """Check whether the target adapter handles the File component.
+
+        Args:
+            target_umo: Destination group.
+
+        Returns:
+            Whether the configured adapter supports PDF files.
+        """
+        if self._validate_target_umo(target_umo):
+            return False
+        session = MessageSession.from_str(target_umo)
+        platform = self.context.get_platform_inst(session.platform_id)
+        return platform is not None and platform.meta().name in {
+            "aiocqhttp",
+            "discord",
+            "lark",
+            "telegram",
+            "satori",
+        }
+
+    async def _send_pdf(self, target_umo: str, path: Path) -> tuple[bool, str | None]:
+        """Send a validated PDF as its own platform message.
+
+        Args:
+            target_umo: Destination group.
+            path: Validated temporary PDF file.
+
+        Returns:
+            Whether the platform accepted the file and an optional error.
+        """
+        if not self._can_send_pdf(target_umo):
+            return False, "此平台改用官方 PDF 網址。"
+        try:
+            chain = MessageChain(chain=[File(name=path.name, file=str(path))]).use_t2i(
+                False
+            )
+            if not await self.context.send_message(target_umo, chain):
+                return False, "找不到目標所屬的平台實例。"
+            return True, None
         except Exception as exc:
             error = self._safe_error(exc)
-            pending_record["last_error"] = error
-            pending_record["last_attempt_at"] = now.isoformat(timespec="seconds")
-            pending_state[fingerprint] = pending_record
-            for target_umo in pending:
-                self._delivery_status = service.mark_delivery_status(
-                    self._delivery_status,
-                    event_fingerprint_value=fingerprint,
-                    target_umo=target_umo,
-                    part="image",
-                    succeeded=False,
-                    error=error,
-                )
-        finally:
-            if remove_temp:
-                with suppress(OSError):
-                    temp_path.unlink(missing_ok=True)
-
-    async def _retry_pending_typhoon_images(self) -> None:
-        pending_state = self._source_state.get("pending_typhoon_images")
-        if not isinstance(pending_state, Mapping):
-            self._source_state["pending_typhoon_images"] = {}
-            return
-        now = datetime.now(service.TAIPEI_TIMEZONE)
-        for fingerprint, stored_record in list(pending_state.items()):
-            if not isinstance(stored_record, Mapping) or stored_record.get(
-                "expired_at"
-            ):
-                continue
-            last_attempt = self._parse_datetime(stored_record.get("last_attempt_at"))
-            if last_attempt and now - last_attempt < timedelta(seconds=60):
-                continue
-            target_umos = stored_record.get("target_umos")
-            if not isinstance(target_umos, Sequence) or isinstance(
-                target_umos, (str, bytes)
-            ):
-                continue
-            await self._dispatch_typhoon_image(
-                str(fingerprint), [str(target) for target in target_umos]
-            )
-        self._prune_pending_typhoon_images(now=now)
-
-    def _prune_pending_typhoon_images(self, *, now: datetime | None = None) -> None:
-        pending_state = self._source_state.get("pending_typhoon_images")
-        if not isinstance(pending_state, Mapping):
-            self._source_state["pending_typhoon_images"] = {}
-            return
-        current = now or datetime.now(service.TAIPEI_TIMEZONE)
-        cutoff = current - timedelta(days=service.STATE_RETENTION_DAYS)
-        retained: list[tuple[datetime, str, dict[str, Any]]] = []
-        removed: set[str] = set()
-        for fingerprint, stored_record in pending_state.items():
-            if not isinstance(stored_record, Mapping):
-                removed.add(str(fingerprint))
-                continue
-            record = dict(stored_record)
-            timestamp = (
-                self._parse_datetime(record.get("expired_at"))
-                or self._parse_datetime(record.get("last_attempt_at"))
-                or self._parse_datetime(record.get("first_attempt_at"))
-                or current
-            )
-            if timestamp.astimezone(service.TAIPEI_TIMEZONE) < cutoff:
-                removed.add(str(fingerprint))
-                continue
-            retained.append((timestamp, str(fingerprint), record))
-        retained.sort(key=lambda item: item[0], reverse=True)
-        for _, fingerprint, _ in retained[service.STATE_MAX_ENTRIES :]:
-            removed.add(fingerprint)
-        self._source_state["pending_typhoon_images"] = {
-            fingerprint: record
-            for _, fingerprint, record in retained[: service.STATE_MAX_ENTRIES]
-        }
-        for fingerprint in removed:
-            with suppress(OSError):
-                (self._temp_directory() / f"typhoon_{fingerprint[:16]}.png").unlink(
-                    missing_ok=True
-                )
+            logger.warning("中央氣象署 PDF 傳送失敗（目標=%s）：%s", target_umo, error)
+            return False, error
 
     async def _send_due_forecasts(self) -> None:
         subscriptions = [
@@ -627,16 +750,12 @@ class CWAAlertPlugin(star.Star):
             text = "\n\n".join(
                 service.format_weather_forecast(forecast) for forecast in selected
             )
-            succeeded, error = await self._send_text(
-                str(subscription.get("target_umo") or ""), text
-            )
-            self._delivery_status = service.mark_delivery_status(
-                self._delivery_status,
-                event_fingerprint_value=slot.key,
-                target_umo=str(subscription.get("target_umo") or ""),
-                part="text",
-                succeeded=succeeded,
-                error=error,
+            succeeded, error = await self._deliver_text(
+                slot.key,
+                subscription["target_umo"],
+                text,
+                "定時天氣預報",
+                kind="weather",
             )
             if succeeded:
                 sent_slots[slot.key] = {
@@ -651,6 +770,7 @@ class CWAAlertPlugin(star.Star):
                 logger.warning("定時天氣播報失敗：%s", error)
         self._prune_forecast_slots()
         await self.put_kv_data(SOURCE_STATE_KEY, self._source_state)
+        await self.put_kv_data(DELIVERY_STATUS_KEY, self._delivery_status)
 
     def _prune_forecast_slots(self) -> None:
         slots = self._source_state.get("forecast_slots")
@@ -744,16 +864,95 @@ class CWAAlertPlugin(star.Star):
             return tuple(forecasts)
         raise CWAClientError("目前沒有可用的天氣資料來源。")
 
-    async def _send_text(self, target_umo: str, text: str) -> tuple[bool, str | None]:
+    async def _deliver_text(
+        self,
+        fingerprint: str,
+        target_umo: str,
+        text: str,
+        title: str,
+        *,
+        kind: str,
+        images: Sequence[Path] = (),
+        mixed: list[tuple[bool, str | None]] | None = None,
+        refresh: bool = False,
+        pdf_url: str | None = None,
+    ) -> tuple[bool, str | None]:
+        key = service.delivery_key(fingerprint, target_umo, "text")
+        previous = self._delivery_status.get(key, {})
+        snapshot = previous.get("content") or {}
+        chunks = snapshot.get("chunks")
+        if (refresh and not snapshot.get("accepted")) or not chunks:
+            if pdf_url:
+                chunks = service.split_message(
+                    text, service.MAX_MESSAGE_LENGTH - len(pdf_url) - 1
+                )
+                chunks[0] += f"\n{pdf_url}"
+            else:
+                chunks = service.split_message(text)
+        accepted = list(chunks[: snapshot.get("accepted", 0)])
+        succeeded, error = await self._send_text(
+            target_umo,
+            text,
+            chunks=chunks,
+            accepted=accepted,
+            images=images,
+            mixed=mixed,
+        )
+        self._delivery_status = service.mark_delivery_status(
+            self._delivery_status,
+            event_fingerprint_value=fingerprint,
+            target_umo=target_umo,
+            part="text",
+            succeeded=succeeded,
+            error=error,
+            content={
+                "title": title,
+                "kind": kind,
+                "chunks": chunks,
+                "accepted": len(chunks) if succeeded else len(accepted),
+            },
+        )
+        return succeeded, error
+
+    async def _send_text(
+        self,
+        target_umo: str,
+        text: str,
+        *,
+        chunks: Sequence[str] | None = None,
+        accepted: list[str] | None = None,
+        images: Sequence[Path] = (),
+        mixed: list[tuple[bool, str | None]] | None = None,
+    ) -> tuple[bool, str | None]:
         validation_error = self._validate_target_umo(target_umo)
         if validation_error:
             return False, validation_error
         try:
-            chunks = service.split_message(text)
-            for index, chunk in enumerate(chunks):
-                sent = await self.context.send_message(
-                    target_umo, MessageChain().message(chunk).use_t2i(False)
-                )
+            chunks = service.split_message(text) if chunks is None else chunks
+            offset = len(accepted) if accepted is not None else 0
+            for index, chunk in enumerate(chunks[offset:], start=offset):
+                sent = False
+                if index == 0 and images:
+                    try:
+                        chain = MessageChain().message(chunk).use_t2i(False)
+                        for path in images:
+                            chain.file_image(str(path))
+                        sent = await self.context.send_message(target_umo, chain)
+                        image_error = None if sent else "平台未接受文字與圖片合併訊息。"
+                    except Exception as exc:
+                        image_error = self._safe_error(exc)
+                    if mixed is not None:
+                        mixed.append((sent, image_error))
+                    if not sent:
+                        logger.warning(
+                            "中央氣象署合併訊息未確認送出，改試純文字（目標=%s）：%s",
+                            target_umo,
+                            image_error,
+                        )
+                if not sent:
+                    sent = await self.context.send_message(
+                        target_umo, MessageChain().message(chunk).use_t2i(False)
+                    )
                 if not sent:
                     error = "找不到目標所屬的平台實例。"
                     logger.error(
@@ -762,6 +961,8 @@ class CWAAlertPlugin(star.Star):
                         error,
                     )
                     return False, error
+                if accepted is not None:
+                    accepted.append(chunk)
                 if index < len(chunks) - 1:
                     await asyncio.sleep(0.2)
             return True, None
@@ -770,34 +971,6 @@ class CWAAlertPlugin(star.Star):
             logger.error(
                 "中央氣象署主動文字播報失敗（目標=%s）：%s",
                 target_umo,
-                error,
-            )
-            return False, error
-
-    async def _send_image(self, target_umo: str, path: Path) -> tuple[bool, str | None]:
-        validation_error = self._validate_target_umo(target_umo)
-        if validation_error:
-            return False, validation_error
-        try:
-            sent = await self.context.send_message(
-                target_umo, MessageChain().file_image(str(path)).use_t2i(False)
-            )
-            if not sent:
-                error = "找不到目標所屬的平台實例。"
-                logger.error(
-                    "中央氣象署主動圖片播報未送出（目標=%s，檔案=%s）：%s",
-                    target_umo,
-                    path.name,
-                    error,
-                )
-                return False, error
-            return True, None
-        except Exception as exc:
-            error = self._safe_error(exc)
-            logger.error(
-                "中央氣象署主動圖片播報失敗（目標=%s，檔案=%s）：%s",
-                target_umo,
-                path.name,
                 error,
             )
             return False, error
@@ -867,11 +1040,41 @@ class CWAAlertPlugin(star.Star):
                 for item in self._groups
             )
             if not conflict:
+                previous = next(
+                    (item for item in self._groups if item["target_umo"] == target_umo),
+                    None,
+                )
+                if previous:
+                    if not display_name.strip():
+                        target["display_name"] = previous["display_name"]
+                    target["registered_at"] = previous["registered_at"]
+                    target["tested_at"] = previous.get("tested_at")
                 self._groups = [
                     item for item in self._groups if item["target_umo"] != target_umo
                 ]
                 self._groups.append(target)
                 await self.put_kv_data(GROUPS_KEY, self._groups)
+                subscriptions = self._settings.setdefault("subscriptions", [])
+                if not any(
+                    item.get("target_umo") == target_umo for item in subscriptions
+                ):
+                    subscriptions.append(
+                        service.normalize_subscription(
+                            {
+                                "target_umo": target_umo,
+                                "enabled": False,
+                                "cities": [],
+                                "forecast_enabled": False,
+                                "forecast_times": list(service.DEFAULT_FORECAST_TIMES),
+                                "alert_types": [],
+                                "media_types": [],
+                            }
+                        )
+                    )
+                    self._settings["revision"] = (
+                        int(self._settings.get("revision", 0)) + 1
+                    )
+                    await self.put_kv_data(SETTINGS_KEY, self._settings)
         if conflict:
             await event.send(
                 MessageChain().message(
@@ -886,7 +1089,7 @@ class CWAAlertPlugin(star.Star):
         )
         await event.send(
             MessageChain().message(
-                f"已登記群組「{target['display_name']}」。請前往外掛管理頁建立播報規則。{suffix}"
+                f"已登記群組「{target['display_name']}」。請在外掛管理頁的「群組播報」調整設定。{suffix}"
             )
         )
 
@@ -1044,10 +1247,14 @@ class CWAAlertPlugin(star.Star):
                 MessageChain().message("目前群組尚未登記，請先使用 /cwa_register。")
             )
             return
-        succeeded, error = await self._send_text(
+        succeeded, error = await self._deliver_text(
+            uuid4().hex,
             target["target_umo"],
             "【中央氣象署播報測試】\n主動訊息傳送已交由 AstrBot 平台介面處理。",
+            "群組測試",
+            kind="test",
         )
+        await self.put_kv_data(DELIVERY_STATUS_KEY, self._delivery_status)
         if not succeeded:
             await event.send(MessageChain().message(f"測試失敗：{error}"))
             return
@@ -1056,19 +1263,216 @@ class CWAAlertPlugin(star.Star):
         )
         await self.put_kv_data(GROUPS_KEY, self._groups)
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("cwa_media")
+    async def cwa_media(self, event: AstrMessageEvent) -> None:
+        """Fetch official media for the current group without polling.
+
+        Args:
+            event: The administrator's group command event.
+        """
+        target = event.unified_msg_origin
+        if event.get_message_type() != MessageType.GROUP_MESSAGE:
+            reason = "此指令只能在群組中使用。"
+        elif not any(group.get("target_umo") == target for group in self._groups):
+            reason = "目前群組尚未登記，請先使用 /cwa_register。"
+        elif target in self._manual_media_targets:
+            reason = "此群組已有圖資查詢正在進行，請稍候。"
+        else:
+            reason = self._validate_target_umo(target)
+        if reason:
+            await event.send(MessageChain().message(reason).use_t2i(False))
+            return
+
+        self._manual_media_targets.add(target)
+        try:
+            await self._send_latest_media(target)
+        except Exception as exc:
+            error = self._safe_error(exc)
+            logger.warning("中央氣象署手動圖資查詢失敗：%s", error)
+            await event.send(
+                MessageChain().message(f"圖資查詢失敗：{error}").use_t2i(False)
+            )
+        finally:
+            self._manual_media_targets.discard(target)
+
+    async def _send_latest_media(self, target: str) -> None:
+        """Collect and send the latest supported official attachments.
+
+        Args:
+            target: Validated unified message origin of the requesting group.
+
+        """
+        client = self._client_instance()
+        notes: list[str] = []
+        media = {
+            key: (STATIC_MEDIA[key], None)
+            for key in ("rain_warning_map", "rain_forecast")
+        }
+
+        if self._settings.get("source_mode") == "rss":
+            notes.append("地震圖資：僅 RSS 模式不查詢開放資料 API。")
+        elif not service.effective_api_key(self._settings):
+            notes.append("地震圖資：需要設定開放資料 API 授權碼。")
+        else:
+            reports: Sequence[AlertEvent] | None = None
+            try:
+                reports = await client.fetch_api_alerts(
+                    (
+                        API_DATASETS["significant_earthquake"],
+                        API_DATASETS["local_earthquake"],
+                    )
+                )
+            except CWAAlertBatchError as exc:
+                reports = exc.partial_events
+                notes.append(f"地震資料集部分或全部無法取得：{self._safe_error(exc)}")
+            except CWAClientError as exc:
+                notes.append(f"無法查詢地震圖資：{self._safe_error(exc)}")
+
+            latest = max(
+                (
+                    (issued, report)
+                    for report in reports or ()
+                    if not report.is_cancellation
+                    and (report.report_image or report.shakemap_image)
+                    and (
+                        issued := self._parse_datetime(
+                            report.published_at or report.effective_at
+                        )
+                    )
+                ),
+                key=lambda item: item[0],
+                default=None,
+            )
+            if latest:
+                issued, report = latest
+                local = issued.astimezone(service.TAIPEI_TIMEZONE)
+                notes.append(f"地震圖資報告時間：{local:%Y/%m/%d %H:%M}（臺灣時間）。")
+                for kind, url in (
+                    ("earthquake_report", report.report_image),
+                    ("earthquake_shakemap", report.shakemap_image),
+                ):
+                    if url:
+                        media[kind] = (url, None)
+                    else:
+                        notes.append(f"{service.MEDIA_LABELS[kind]}：該報告未提供。")
+            elif reports is not None:
+                notes.append("地震圖資：找不到附有圖片的地震報告。")
+
+        issued = None
+        try:
+            issued = await client.active_typhoon_issued_at()
+        except CWAClientError as exc:
+            notes.append(f"颱風警報狀態無法確認，略過警報圖片：{self._safe_error(exc)}")
+        else:
+            if issued is None:
+                notes.append("官網目前未發布有效颱風警報，略過警報單與動態圖。")
+        cutoff = None
+        if issued:
+            cutoff = issued.replace(tzinfo=service.TAIPEI_TIMEZONE) - timedelta(
+                minutes=5
+            )
+            media["typhoon_bulletin"] = (TYPHOON_BULLETIN_URL, cutoff)
+            media["typhoon_track"] = (STATIC_MEDIA["typhoon_track"], cutoff)
+        media["typhoon_pdf"] = (STATIC_MEDIA["typhoon_pdf"], cutoff)
+
+        fingerprint = uuid4().hex
+        directory = self._temp_directory()
+        directory.mkdir(parents=True, exist_ok=True)
+        contents: dict[str, dict[str, Any]] = {}
+        outcomes: dict[str, tuple[bool, str | None]] = {}
+        images: dict[str, Path] = {}
+        with TemporaryDirectory(dir=directory, prefix="media_") as temp:
+            for kind, (url, modified_since) in media.items():
+                label = service.MEDIA_LABELS[kind].split("（", 1)[0]
+                if kind == "typhoon_pdf" and not issued:
+                    label += "（不作現行警報使用）"
+                content: dict[str, Any] = {
+                    "title": f"手動圖資｜{label}",
+                    "kind": "test",
+                }
+                contents[kind] = content
+                try:
+                    path = await client.download_official_media(
+                        url, Path(temp), label, modified_since=modified_since
+                    )
+                    if kind == "typhoon_pdf":
+                        succeeded, error = await self._send_pdf(target, path)
+                        if succeeded:
+                            content["media_name"] = path.name
+                            outcomes[kind] = (True, None)
+                            notes.append(f"{label}：已另外交付檔案給平台。")
+                        else:
+                            content["chunks"] = [url]
+                            notes.extend((f"{label}：{error or '無法傳檔'}", url))
+                    else:
+                        content["media_name"] = path.name
+                        images[kind] = path
+                        notes.append(f"{label}：已下載。")
+                except Exception as exc:
+                    error = self._safe_error(exc)
+                    logger.warning(
+                        "中央氣象署手動圖資處理失敗（類型=%s）：%s", label, error
+                    )
+                    outcomes[kind] = (False, error)
+                    notes.append(f"{label}：{error}")
+            text = "\n".join(
+                [
+                    "【中央氣象署｜手動圖資查詢】",
+                    "可能包含過往報告，不代表有新警報。",
+                    *notes,
+                ]
+            )
+            mixed: list[tuple[bool, str | None]] = []
+            succeeded, error = await self._deliver_text(
+                fingerprint,
+                target,
+                text,
+                "手動圖資查詢",
+                kind="test",
+                images=list(images.values()),
+                mixed=mixed,
+            )
+            for kind in images:
+                outcomes[kind] = mixed[0] if mixed else (False, error)
+            if "typhoon_pdf" not in outcomes:
+                outcomes["typhoon_pdf"] = (succeeded, error)
+            for kind, (part_succeeded, part_error) in outcomes.items():
+                self._delivery_status = service.mark_delivery_status(
+                    self._delivery_status,
+                    event_fingerprint_value=fingerprint,
+                    target_umo=target,
+                    part=kind,
+                    succeeded=part_succeeded,
+                    error=part_error,
+                    content=contents[kind],
+                )
+            await self.put_kv_data(DELIVERY_STATUS_KEY, self._delivery_status)
+        if not succeeded:
+            raise CWAClientError(error or "查詢結果未能交付平台。")
+
     async def page_state(self):
         targets = [self._target_public_state(target) for target in self._groups]
         deliveries = sorted(
             (
-                dict(record)
-                for record in self._delivery_status.values()
+                {
+                    **{
+                        name: value
+                        for name, value in record.items()
+                        if name != "content"
+                    },
+                    "id": key,
+                    "title": (record.get("content") or {}).get("title"),
+                    "kind": (record.get("content") or {}).get("kind"),
+                }
+                for key, record in self._delivery_status.items()
                 if isinstance(record, Mapping)
             ),
             key=lambda item: str(
                 item.get("last_attempt_at") or item.get("delivered_at") or ""
             ),
             reverse=True,
-        )[:100]
+        )
         source_state = dict(self._source_state)
         decision = service.select_data_source(self._settings, self._source_state)
         source_state.update(asdict(decision))
@@ -1083,9 +1487,20 @@ class CWAAlertPlugin(star.Star):
                 "delivery_status": deliveries,
                 "cities": list(service.OFFICIAL_CITIES),
                 "alert_types": dict(service.ALERT_TYPE_LABELS),
+                "media_types": dict(service.MEDIA_LABELS),
                 "started_at": self._started_at.isoformat(timespec="seconds"),
             }
         )
+
+    async def page_delivery_detail(self):
+        payload = await request.json(default={})
+        key = payload.get("id") if isinstance(payload, Mapping) else None
+        if not isinstance(key, str) or len(key) > 256:
+            return error_response("傳送紀錄識別碼無效。")
+        record = self._delivery_status.get(key)
+        if not isinstance(record, Mapping):
+            return error_response("這筆傳送紀錄已不存在。", status_code=404)
+        return json_response({"record": dict(record)})
 
     async def page_save_settings(self):
         payload = await request.json(default={})
@@ -1109,9 +1524,15 @@ class CWAAlertPlugin(star.Star):
                     existing_api_key=str(self._settings.get("api_key") or ""),
                 )
                 for subscription in normalized["subscriptions"]:
+                    already_enabled = any(
+                        item["target_umo"] == subscription["target_umo"]
+                        and item["enabled"]
+                        for item in self._settings["subscriptions"]
+                    )
                     target_error = self._validate_target_umo(
                         subscription["target_umo"],
-                        require_available=bool(subscription["enabled"]),
+                        require_available=subscription["enabled"]
+                        and not already_enabled,
                     )
                     if target_error:
                         raise service.ValidationError(target_error)
@@ -1216,10 +1637,14 @@ class CWAAlertPlugin(star.Star):
         target = next((item for item in self._groups if item["id"] == target_id), None)
         if not target:
             return error_response("找不到指定的已登記群組。", status_code=404)
-        succeeded, error = await self._send_text(
+        succeeded, error = await self._deliver_text(
+            uuid4().hex,
             target["target_umo"],
             "【中央氣象署播報測試】\n此訊息由外掛管理頁主動傳送。",
+            "群組測試",
+            kind="test",
         )
+        await self.put_kv_data(DELIVERY_STATUS_KEY, self._delivery_status)
         if not succeeded:
             return json_response({"ok": False, "message": error or "傳送失敗。"})
         sent_at = datetime.now(service.TAIPEI_TIMEZONE).isoformat(timespec="seconds")

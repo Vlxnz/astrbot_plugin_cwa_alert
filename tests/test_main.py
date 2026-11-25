@@ -11,7 +11,7 @@ import tempfile
 import types
 import unittest
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -67,8 +67,9 @@ class StubMessageSession:
 class StubMessageChain:
     """Capture text and image operations without loading AstrBot components."""
 
-    def __init__(self) -> None:
+    def __init__(self, chain: list[Any] | None = None) -> None:
         self.parts: list[tuple[str, str]] = []
+        self.chain: list[Any] = list(chain or [])
         self.t2i_enabled: bool | None = None
 
     def message(self, text: str) -> StubMessageChain:
@@ -268,6 +269,7 @@ def _install_astrbot_stubs() -> dict[str, types.ModuleType]:
         "astrbot.api.web",
         "astrbot.core",
         "astrbot.core.message",
+        "astrbot.core.message.components",
         "astrbot.core.message.message_event_result",
         "astrbot.core.platform",
         "astrbot.core.platform.message_session",
@@ -295,6 +297,7 @@ def _install_astrbot_stubs() -> dict[str, types.ModuleType]:
     modules["astrbot.api.web"].json_response = _json_response
     modules["astrbot.api.web"].error_response = _error_response
     modules["astrbot.api.web"].request = STUB_REQUEST
+    modules["astrbot.core.message.components"].File = SimpleNamespace
     modules["astrbot.core.message.message_event_result"].MessageChain = StubMessageChain
     modules["astrbot.core.platform.message_session"].MessageSession = StubMessageSession
     modules[
@@ -428,30 +431,6 @@ class SourceClient:
         return value
 
 
-class BulletinClient:
-    """Return a stable image hash or fail before writing."""
-
-    def __init__(self, *, error: BaseException | None = None) -> None:
-        self.error = error
-        self.calls = 0
-
-    async def download_typhoon_bulletin(
-        self,
-        destination: Path,
-        *,
-        cache_token: str | None = None,
-    ) -> Any:
-        """Return one deterministic image result."""
-
-        del cache_token
-        self.calls += 1
-        if self.error is not None:
-            raise self.error
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(b"test-image")
-        return SimpleNamespace(path=destination, sha256="stable-image-hash")
-
-
 class LifecycleAndRegistrationTests(unittest.IsolatedAsyncioTestCase):
     """Validate task lifetime and explicit group registration rules."""
 
@@ -530,6 +509,13 @@ class LifecycleAndRegistrationTests(unittest.IsolatedAsyncioTestCase):
         plugin = main.CWAAlertPlugin(context)
         event = StubEvent("qq:group:weather", group_name="氣象群組")
         await plugin.cwa_register(event)
+        rule = plugin._settings["subscriptions"][0]
+        self.assertEqual(rule["target_umo"], event.unified_msg_origin)
+        self.assertFalse(rule["enabled"])
+        self.assertEqual(rule["cities"], [])
+        self.assertEqual(rule["media_types"], [])
+        await plugin.cwa_register(event)
+        self.assertEqual(len(plugin._settings["subscriptions"]), 1)
         plugin._settings["subscriptions"] = [
             _subscription(event.unified_msg_origin, "rain")
         ]
@@ -539,7 +525,7 @@ class LifecycleAndRegistrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(plugin._groups, [])
         self.assertEqual(len(plugin._settings["subscriptions"]), 1)
         self.assertFalse(plugin._settings["subscriptions"][0]["enabled"])
-        self.assertEqual(plugin._settings["revision"], 1)
+        self.assertEqual(plugin._settings["revision"], 2)
         self.assertIn("規則已停用", event.last_text())
 
     async def test_status_reports_mode_and_both_source_health_states(self) -> None:
@@ -907,133 +893,394 @@ class SourceHealthAndBaselineTests(unittest.IsolatedAsyncioTestCase):
         plugin._send_text.assert_not_awaited()
 
 
-class TyphoonDeliveryTests(unittest.IsolatedAsyncioTestCase):
-    """Validate independent text and image delivery state."""
+class ManualMediaTests(unittest.IsolatedAsyncioTestCase):
+    """Verify on-demand delivery independently of automatic alerts."""
 
-    async def test_text_success_is_retained_when_image_download_fails(self) -> None:
+    async def test_no_active_typhoon_sends_maps_and_pdf_to_requesting_group(
+        self,
+    ) -> None:
+        context = StubContext()
+        context.platforms["qq"] = StubPlatform("aiocqhttp")
+        plugin = main.CWAAlertPlugin(context)
+        plugin._settings.update({"enabled": False, "source_mode": "rss"})
         target = "qq:group:100"
-        plugin = main.CWAAlertPlugin(StubContext())
-        plugin._settings = service.default_settings()
-        plugin._settings["subscriptions"] = [_subscription(target, "typhoon")]
-        event = _alert()
-        fingerprint = service.event_fingerprint(event)
-        plugin._client = BulletinClient(error=main.CWAClientError("圖片下載失敗"))
-        plugin._send_text = AsyncMock(return_value=(True, None))
+        plugin._groups = [{"target_umo": target}, {"target_umo": "qq:group:200"}]
+        event = StubEvent(target)
 
-        await plugin._dispatch_alert_events([event], baseline_only=False)
+        async def download(url: str, directory: Path, name: str, **kwargs: Any) -> Path:
+            self.assertIsNone(kwargs["modified_since"])
+            path = directory / (name + Path(url).suffix)
+            path.write_bytes(b"fixture")
+            return path
 
-        self.assertTrue(
-            service.delivery_succeeded(
-                plugin._delivery_status,
-                fingerprint,
-                target,
-                "text",
-            )
+        plugin._client = SimpleNamespace(
+            active_typhoon_issued_at=AsyncMock(return_value=None),
+            fetch_api_alerts=AsyncMock(),
+            download_official_media=AsyncMock(side_effect=download),
         )
-        self.assertFalse(
-            service.delivery_succeeded(
-                plugin._delivery_status,
-                fingerprint,
-                target,
-                "image",
-            )
-        )
-        image_key = service.delivery_key(fingerprint, target, "image")
-        self.assertEqual(plugin._delivery_status[image_key]["error"], "圖片下載失敗")
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch.object(plugin, "_temp_directory", return_value=Path(temp_dir)),
+        ):
+            await plugin.cwa_media(event)
+            self.assertEqual(list(Path(temp_dir).iterdir()), [])
 
-    async def test_partial_image_success_retries_only_failed_target_with_same_image(
+        plugin._client.fetch_api_alerts.assert_not_awaited()
+        self.assertEqual(
+            {
+                call.args[0]
+                for call in plugin._client.download_official_media.await_args_list
+            },
+            {
+                main.STATIC_MEDIA[key]
+                for key in ("rain_warning_map", "rain_forecast", "typhoon_pdf")
+            },
+        )
+        self.assertEqual([umo for umo, _ in context.sent], [target] * 2)
+        self.assertIn("不作現行警報使用", context.sent[0][1].chain[0].name)
+        parts = context.sent[1][1].parts
+        self.assertEqual([kind for kind, _ in parts], ["text", "image", "image"])
+        self.assertIn("略過警報單與動態圖", parts[0][1])
+        self.assertEqual(event.sent, [])
+        self.assertEqual(len(plugin._delivery_status), 4)
+        self.assertFalse(plugin._seen_events)
+
+    async def test_latest_earthquake_and_active_typhoon_continue_after_failure(
         self,
     ) -> None:
-        first_target = "qq:group:first"
-        second_target = "qq:group:second"
+        context = StubContext()
+        context.platforms["work"] = StubPlatform("wecom_ai_bot")
+        plugin = main.CWAAlertPlugin(context)
+        plugin._settings["api_key"] = "test-key"
+        target = "work:group:100"
+        plugin._groups = [{"target_umo": target}]
+        event = StubEvent(target)
+        local = datetime.now(service.TAIPEI_TIMEZONE).replace(tzinfo=None)
+        older = replace(
+            _alert(category="significant_earthquake"),
+            published_at=(local - timedelta(days=4)).isoformat(),
+            report_image="https://scweb.cwa.gov.tw/older.png",
+        )
+        latest = replace(
+            _alert(category="local_earthquake"),
+            published_at=(local - timedelta(days=2)).isoformat(),
+            report_image="https://scweb.cwa.gov.tw/latest.png",
+            shakemap_image="https://scweb.cwa.gov.tw/shakemap.png",
+        )
+
+        async def download(url: str, directory: Path, name: str, **kwargs: Any) -> Path:
+            if url == main.STATIC_MEDIA["rain_warning_map"]:
+                raise main.CWAClientError("圖資目前無法下載。")
+            if "typhoon" in url:
+                self.assertEqual(
+                    kwargs["modified_since"],
+                    local.replace(tzinfo=service.TAIPEI_TIMEZONE)
+                    - timedelta(minutes=5),
+                )
+            path = directory / (name + Path(url).suffix)
+            path.write_bytes(b"fixture")
+            return path
+
+        plugin._client = SimpleNamespace(
+            active_typhoon_issued_at=AsyncMock(return_value=local),
+            fetch_api_alerts=AsyncMock(return_value=(latest, older)),
+            download_official_media=AsyncMock(side_effect=download),
+        )
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch.object(plugin, "_temp_directory", return_value=Path(temp_dir)),
+            self.assertLogs("astrbot", level="WARNING"),
+        ):
+            await plugin.cwa_media(event)
+            self.assertEqual(list(Path(temp_dir).iterdir()), [])
+
+        plugin._client.fetch_api_alerts.assert_awaited_once_with(
+            ("E-A0015-001", "E-A0016-001")
+        )
+        downloaded = [
+            call.args[0]
+            for call in plugin._client.download_official_media.await_args_list
+        ]
+        self.assertNotIn(older.report_image, downloaded)
+        self.assertIn(latest.report_image, downloaded)
+        self.assertIn(latest.shakemap_image, downloaded)
+        self.assertIn(main.TYPHOON_BULLETIN_URL, downloaded)
+        self.assertIn(main.STATIC_MEDIA["typhoon_track"], downloaded)
+        self.assertEqual(len(context.sent), 1)
+        parts = context.sent[0][1].parts
+        self.assertGreater(len(parts), 1)
+        self.assertIn(main.STATIC_MEDIA["typhoon_pdf"], parts[0][1])
+        self.assertIn("圖資目前無法下載", parts[0][1])
+        self.assertEqual(event.sent, [])
+
+    async def test_rejects_private_and_unregistered_groups(self) -> None:
         plugin = main.CWAAlertPlugin(StubContext())
-        client = BulletinClient()
-        plugin._client = client
-        event = _alert()
+        with patch.object(plugin, "_send_latest_media", new_callable=AsyncMock) as send:
+            for scene, expected in (
+                (StubMessageType.FRIEND_MESSAGE, "只能在群組中使用"),
+                (StubMessageType.GROUP_MESSAGE, "尚未登記"),
+            ):
+                event = StubEvent("qq:group:100", message_type=scene)
+                await plugin.cwa_media(event)
+                self.assertIn(expected, event.last_text())
+            send.assert_not_awaited()
+
+
+class CombinedAlertTests(unittest.IsolatedAsyncioTestCase):
+    """Verify per-group opt-in and text-first fallbacks."""
+
+    async def test_rain_images_share_one_message_and_are_never_backfilled(self) -> None:
+        context = StubContext()
+        context.platforms["qq"] = StubPlatform("aiocqhttp")
+        plugin = main.CWAAlertPlugin(context)
+        selected, text_only = "qq:group:100", "qq:group:200"
+        plugin._settings["subscriptions"] = [
+            {
+                **_subscription(selected, "rain"),
+                "media_types": ["rain_warning_map", "rain_forecast"],
+            },
+            {**_subscription(text_only, "rain"), "media_types": []},
+        ]
+        event = _alert(category="rain", title="大雨特報")
+
+        async def download(url: str, directory: Path, name: str, **kwargs: Any) -> Path:
+            self.assertIsNotNone(kwargs["modified_since"])
+            self.assertEqual([target for target, _ in context.sent], [text_only])
+            path = directory / (name + Path(url).suffix)
+            path.write_bytes(b"fixture")
+            return path
+
+        media = AsyncMock(side_effect=download)
+        plugin._client = SimpleNamespace(download_official_media=media)
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch.object(plugin, "_temp_directory", return_value=Path(temp_dir)),
+        ):
+            await plugin._dispatch_alert_events([event, event], baseline_only=False)
+            await plugin._dispatch_alert_events([event], baseline_only=False)
+            self.assertEqual(list(Path(temp_dir).iterdir()), [])
+
+        self.assertEqual([target for target, _ in context.sent], [text_only, selected])
+        self.assertEqual([kind for kind, _ in context.sent[0][1].parts], ["text"])
+        self.assertEqual(
+            [kind for kind, _ in context.sent[1][1].parts], ["text", "image", "image"]
+        )
+        self.assertEqual(media.await_count, 2)
+
+    async def test_typhoon_pdf_sends_separately_or_uses_inline_link(self) -> None:
+        context = StubContext()
+        context.platforms["qq"] = StubPlatform("aiocqhttp")
+        context.platforms["work"] = StubPlatform("wecom_ai_bot")
+        plugin = main.CWAAlertPlugin(context)
+        target = "qq:group:100"
+        link_only = "work:group:200"
+        image_only = "qq:group:300"
+        plugin._settings["subscriptions"] = [
+            {
+                **_subscription(target, "typhoon"),
+                "media_types": ["typhoon_bulletin", "typhoon_pdf"],
+            },
+            {
+                **_subscription(link_only, "typhoon"),
+                "media_types": ["typhoon_bulletin", "typhoon_pdf"],
+            },
+            {
+                **_subscription(image_only, "typhoon"),
+                "media_types": ["typhoon_bulletin"],
+            },
+        ]
+        event = _alert(title="颱風")
+        site_time = datetime.fromisoformat(event.published_at).astimezone(
+            service.TAIPEI_TIMEZONE
+        )
+
+        async def download(url: str, directory: Path, name: str, **kwargs: Any) -> Path:
+            self.assertIsNotNone(kwargs["modified_since"])
+            path = directory / (name + Path(url).suffix)
+            path.write_bytes(b"fixture")
+            return path
+
+        plugin._client = SimpleNamespace(
+            active_typhoon_issued_at=AsyncMock(
+                return_value=site_time.replace(tzinfo=None)
+            ),
+            download_official_media=AsyncMock(side_effect=download),
+        )
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch.object(plugin, "_temp_directory", return_value=Path(temp_dir)),
+        ):
+            await plugin._dispatch_alert_events([event], baseline_only=False)
+            await plugin._dispatch_alert_events([event], baseline_only=False)
+            await plugin._dispatch_alert_events(
+                [replace(event, title="解除颱風警報", is_cancellation=True)],
+                baseline_only=False,
+            )
+        self.assertEqual(plugin._client.download_official_media.await_count, 2)
+        self.assertEqual(
+            [umo for umo, _ in context.sent],
+            [target, target, link_only, image_only, target, link_only, image_only],
+        )
+        pdf = main.STATIC_MEDIA["typhoon_pdf"]
+        for index in (0, 2, 3):
+            parts = context.sent[index][1].parts
+            self.assertEqual([kind for kind, _ in parts], ["text", "image"])
+            self.assertEqual(pdf in parts[0][1], index == 2)
+        self.assertTrue(context.sent[1][1].chain[0].name.endswith(".pdf"))
+        self.assertEqual(context.sent[1][1].parts, [])
+        for _, chain in context.sent[4:]:
+            self.assertEqual([kind for kind, _ in chain.parts], ["text"])
+            self.assertNotIn(pdf, chain.parts[0][1])
+
+    async def test_download_failure_sends_text_without_later_image(self) -> None:
+        context = StubContext()
+        context.platforms["qq"] = StubPlatform("aiocqhttp")
+        plugin = main.CWAAlertPlugin(context)
+        target = "qq:group:100"
+        plugin._settings["subscriptions"] = [
+            {**_subscription(target, "rain"), "media_types": ["rain_forecast"]},
+        ]
+        event = _alert(category="rain")
+        media = AsyncMock(side_effect=main.CWAClientError("圖片下載失敗"))
+        plugin._client = SimpleNamespace(download_official_media=media)
+
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch.object(plugin, "_temp_directory", return_value=Path(temp_dir)),
+            self.assertLogs("astrbot", level="WARNING"),
+        ):
+            await plugin._dispatch_alert_events([event], baseline_only=False)
+            await plugin._dispatch_alert_events([event], baseline_only=False)
+
+        media.assert_awaited_once()
+        self.assertEqual(len(context.sent), 1)
+        self.assertEqual([kind for kind, _ in context.sent[0][1].parts], ["text"])
         fingerprint = service.event_fingerprint(event)
-        attempts: list[str] = []
+        key = service.delivery_key(fingerprint, target, "rain_forecast")
+        self.assertEqual(plugin._delivery_status[key]["error"], "圖片下載失敗")
 
-        async def send_image(target_umo: str, path: Path) -> tuple[bool, str | None]:
-            del path
-            attempts.append(target_umo)
-            if target_umo == second_target and attempts.count(second_target) == 1:
-                return False, "平台暫時失敗"
-            return True, None
-
-        plugin._send_image = send_image
-        with tempfile.TemporaryDirectory() as temp_dir:
-            with patch.object(
-                plugin,
-                "_temp_directory",
-                return_value=Path(temp_dir),
-            ):
-                await plugin._dispatch_typhoon_image(
-                    fingerprint,
-                    [first_target, second_target],
-                )
-                await plugin._dispatch_typhoon_image(
-                    fingerprint,
-                    [first_target, second_target],
-                )
-
-        self.assertEqual(attempts, [first_target, second_target, second_target])
-        self.assertTrue(
-            service.delivery_succeeded(
-                plugin._delivery_status,
-                fingerprint,
-                first_target,
-                "image",
+    async def test_rejected_mixed_send_falls_back_to_text(self) -> None:
+        context = StubContext()
+        context.platforms["qq"] = StubPlatform("aiocqhttp")
+        context.send_results = [RuntimeError("平台拒絕圖片"), True]
+        plugin = main.CWAAlertPlugin(context)
+        mixed = []
+        with self.assertLogs("astrbot", level="WARNING"):
+            succeeded, error = await plugin._deliver_text(
+                "event",
+                "qq:group:100",
+                "測試訊息",
+                "測試",
+                kind="rain",
+                images=[Path("test.png")],
+                mixed=mixed,
             )
+        self.assertTrue(succeeded)
+        self.assertIsNone(error)
+        self.assertEqual(mixed, [(False, "平台拒絕圖片")])
+        self.assertEqual(
+            [[kind for kind, _ in chain.parts] for _, chain in context.sent],
+            [["text", "image"], ["text"]],
         )
-        self.assertTrue(
-            service.delivery_succeeded(
-                plugin._delivery_status,
-                fingerprint,
-                second_target,
-                "image",
+
+    async def test_timed_out_image_does_not_discard_a_ready_image(self) -> None:
+        context = StubContext()
+        context.platforms["qq"] = StubPlatform("aiocqhttp")
+        plugin = main.CWAAlertPlugin(context)
+        target = "qq:group:100"
+        plugin._settings["subscriptions"] = [
+            {
+                **_subscription(target, "rain"),
+                "media_types": ["rain_warning_map", "rain_forecast"],
+            },
+        ]
+        event = _alert(category="rain")
+
+        async def download(url: str, directory: Path, name: str, **kwargs: Any) -> Path:
+            if url == main.STATIC_MEDIA["rain_warning_map"]:
+                await asyncio.Event().wait()
+            return directory / f"{name}.png"
+
+        plugin._client = SimpleNamespace(download_official_media=download)
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch.object(plugin, "_temp_directory", return_value=Path(temp_dir)),
+            patch.object(main, "ALERT_MEDIA_TIMEOUT_SECONDS", 0.01),
+            self.assertLogs("astrbot", level="WARNING"),
+        ):
+            await plugin._dispatch_alert_events([event], baseline_only=False)
+        self.assertEqual(len(context.sent), 1)
+        self.assertEqual(
+            [kind for kind, _ in context.sent[0][1].parts], ["text", "image"]
+        )
+        key = service.delivery_key(
+            service.event_fingerprint(event), target, "rain_warning_map"
+        )
+        self.assertIn("逾時", plugin._delivery_status[key]["error"])
+
+    async def test_partial_text_retry_does_not_repeat_images_or_pdf(self) -> None:
+        context = StubContext()
+        context.platforms["qq"] = StubPlatform("aiocqhttp")
+        context.send_results = [True, False, True]
+        plugin = main.CWAAlertPlugin(context)
+        target = "qq:group:100"
+        text = "甲" * 1500 + "\n\n" + "乙" * 600
+        pdf = main.STATIC_MEDIA["typhoon_pdf"]
+        with patch.object(main.asyncio, "sleep", new_callable=AsyncMock):
+            ok, _ = await plugin._deliver_text(
+                "event",
+                target,
+                text,
+                "測試",
+                kind="typhoon",
+                images=[Path("test.png")],
+                pdf_url=pdf,
+                refresh=True,
             )
-        )
-
-    async def test_pending_image_retries_without_waiting_for_next_alert_poll(
-        self,
-    ) -> None:
-        target = "qq:group:retry"
-        plugin = main.CWAAlertPlugin(StubContext())
-        plugin._client = BulletinClient()
-        fingerprint = service.event_fingerprint(_alert())
-        attempts = 0
-
-        async def send_image(target_umo: str, path: Path) -> tuple[bool, str | None]:
-            nonlocal attempts
-            del target_umo, path
-            attempts += 1
-            if attempts == 1:
-                return False, "平台暫時失敗"
-            return True, None
-
-        plugin._send_image = send_image
-        with tempfile.TemporaryDirectory() as temp_dir:
-            with patch.object(
-                plugin,
-                "_temp_directory",
-                return_value=Path(temp_dir),
-            ):
-                await plugin._dispatch_typhoon_image(fingerprint, [target])
-                pending = plugin._source_state["pending_typhoon_images"][fingerprint]
-                pending["last_attempt_at"] = (
-                    datetime.now(service.TAIPEI_TIMEZONE) - timedelta(seconds=61)
-                ).isoformat()
-
-                await plugin._retry_pending_typhoon_images()
-
-        self.assertEqual(attempts, 2)
-        self.assertNotIn(
-            fingerprint, plugin._source_state.get("pending_typhoon_images", {})
-        )
+            self.assertFalse(ok)
+            ok, _ = await plugin._deliver_text(
+                "event",
+                target,
+                text,
+                "測試",
+                kind="typhoon",
+                refresh=True,
+            )
+        self.assertTrue(ok)
+        self.assertIn(pdf, context.sent[0][1].parts[0][1])
+        self.assertEqual(context.sent[-1][1].parts, [("text", "乙" * 600)])
 
 
 class PluginPageTests(unittest.IsolatedAsyncioTestCase):
     """Validate secret masking and optimistic concurrency responses."""
+
+    async def test_history_previews_delivered_chunks_and_retries_only_remaining(
+        self,
+    ) -> None:
+        context = StubContext()
+        context.platforms["qq"] = StubPlatform("aiocqhttp", proactive=True)
+        context.send_results = [True, False, True]
+        plugin = main.CWAAlertPlugin(context)
+        target = "qq:group:history"
+        text = "甲" * 1700 + "\n\n" + "乙" * 600
+        result, _ = await plugin._deliver_text(
+            "event", target, text, "測試", kind="weather"
+        )
+        self.assertFalse(result)
+        summary = (await plugin.page_state()).body["delivery_status"][0]
+        self.assertNotIn("content", summary)
+
+        STUB_REQUEST.payload = {"id": summary["id"]}
+        detail = (await plugin.page_delivery_detail()).body["record"]
+        self.assertEqual(detail["content"]["accepted"], 1)
+        self.assertEqual(detail["content"]["chunks"], service.split_message(text))
+
+        result, _ = await plugin._deliver_text(
+            "event", target, "下一輪更新", "測試", kind="weather"
+        )
+        self.assertTrue(result)
+        expected_second_chunk = service.split_message(text)[1]
+        self.assertEqual(context.sent[-1][1].parts, [("text", expected_second_chunk)])
 
     async def test_page_state_masks_api_key_and_returns_only_suffix(self) -> None:
         plugin = main.CWAAlertPlugin(StubContext())

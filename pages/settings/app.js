@@ -64,15 +64,17 @@ const dom = {
   apiKeyInput: document.getElementById("api-key-input"),
   clearApiKeyInput: document.getElementById("clear-api-key-input"),
   apiKeyState: document.getElementById("api-key-state"),
-  addRuleButton: document.getElementById("add-rule-button"),
+  groupSearch: document.getElementById("group-search"),
+  groupFilter: document.getElementById("group-filter"),
   rulesContainer: document.getElementById("rules-container"),
   rulesSummary: document.getElementById("rules-summary"),
   sourceTestInput: document.getElementById("source-test-input"),
   sourceTestButton: document.getElementById("source-test-button"),
   sourceDetail: document.getElementById("source-detail"),
   sourceTestResult: document.getElementById("source-test-result"),
-  targetsContainer: document.getElementById("targets-container"),
-  targetsSummary: document.getElementById("targets-summary"),
+  deliveryGroup: document.getElementById("delivery-group"),
+  deliveryFilter: document.getElementById("delivery-filter"),
+  deliveryKind: document.getElementById("delivery-kind"),
   deliveryBody: document.getElementById("delivery-body"),
   deliverySummary: document.getElementById("delivery-summary"),
   confirmDialog: document.getElementById("confirm-dialog"),
@@ -95,6 +97,10 @@ const state = {
   deliveryStatus: [],
   cityOptions: CITY_OPTIONS,
   alertOptions: ALERT_OPTIONS,
+  mediaOptions: [],
+  groupPage: 0,
+  deliveryPage: 0,
+  openGroup: "",
   apiKeyFromEnvironment: false,
   dirty: false,
   busy: false,
@@ -175,7 +181,7 @@ function setBusy(value) {
   state.busy = value;
   dom.refreshButton.disabled = value;
   dom.saveButton.disabled = value;
-  dom.addRuleButton.disabled = value || state.targets.length === 0;
+  document.querySelector(".operations-main").inert = value;
 }
 
 function showError(message) {
@@ -239,19 +245,21 @@ function normalizeSettings(raw) {
         .map(String)
         .slice(0, 4),
       alert_types: asArray(subscription?.alert_types).map(String),
+      media_types: asArray(subscription?.media_types).map(String),
     })),
   };
 }
 
-function defaultSubscription(target = null) {
+function defaultSubscription(target) {
   return {
     id: makeId(),
     target_umo: String(target?.target_umo || ""),
-    enabled: true,
-    cities: ["臺北市"],
-    forecast_enabled: true,
+    enabled: false,
+    cities: [],
+    forecast_enabled: false,
     forecast_times: ["07:30", "18:30"],
-    alert_types: state.alertOptions.map(([value]) => value),
+    alert_types: [],
+    media_types: [],
   };
 }
 
@@ -270,6 +278,7 @@ function applyState(payload) {
   state.targets = asArray(payload?.targets).map((target) => ({ ...target }));
   state.sourceState = payload?.source_state || {};
   state.deliveryStatus = asArray(payload?.delivery_status);
+  state.mediaOptions = Object.entries(payload?.media_types || {});
   state.cityOptions = asArray(payload?.cities).length
     ? payload.cities.map((city) => [String(city), String(city)])
     : CITY_OPTIONS;
@@ -301,8 +310,20 @@ function applyState(payload) {
 
   renderStatus();
   renderSourceDetail();
-  renderTargets();
   renderRules();
+  const selectedGroup = dom.deliveryGroup.value;
+  dom.deliveryGroup.replaceChildren(new Option("所有群組", ""));
+  for (const umo of new Set([
+    ...state.targets.map((target) => target.target_umo),
+    ...state.deliveryStatus.map((record) => record.target_umo),
+  ])) {
+    if (!umo) continue;
+    const target = findTargetByUmo(umo);
+    dom.deliveryGroup.add(new Option(target ? targetLabel(target) : umo, umo));
+  }
+  if (Array.from(dom.deliveryGroup.options).some((option) => option.value === selectedGroup)) {
+    dom.deliveryGroup.value = selectedGroup;
+  }
   renderDelivery();
   setDirty(false);
 }
@@ -370,56 +391,6 @@ function renderSourceDetail() {
   if (source.last_rss_error) appendDetail("RSS 錯誤", String(source.last_rss_error));
 }
 
-function createTargetOption(target, selectedUmo) {
-  const option = document.createElement("option");
-  option.value = String(target.target_umo || "");
-  const availability = target.available === false ? " · 目前不可用" : "";
-  option.textContent = `${targetLabel(target)} · ${target.platform_type || target.platform_id || "平台未知"}${availability}`;
-  option.selected = option.value === selectedUmo;
-  option.disabled = target.available === false && !option.selected;
-  return option;
-}
-
-function renderTargets() {
-  dom.targetsContainer.replaceChildren();
-  dom.targetsSummary.textContent = `${state.targets.length} 個`;
-  dom.addRuleButton.disabled = state.busy || state.targets.length === 0;
-
-  if (state.targets.length === 0) {
-    dom.targetsContainer.append(emptyState("尚無已登記群組"));
-    return;
-  }
-
-  for (const target of state.targets) {
-    const item = createElement("div", "target-item");
-    const info = createElement("div");
-    info.append(createElement("div", "target-name", targetLabel(target)));
-    const meta = createElement("div", "target-meta");
-    meta.append(
-      createElement("span", "tag", target.platform_type || target.platform_id || "未知平台"),
-      createElement("span", "tag", target.group_id || "群組 ID 未知"),
-    );
-    const availability = createElement(
-      "span",
-      `status-pill ${target.available === false ? "status-danger" : "status-success"}`,
-      target.available === false ? "目前不可用" : "可主動發送",
-    );
-    availability.title = String(target.availability_message || "");
-    meta.append(availability);
-    if (target.registered_at) {
-      meta.append(createElement("span", "tag", `登記 ${formatTime(target.registered_at)}`));
-    }
-    info.append(meta);
-
-    const remove = createElement("button", "button button-quiet-danger button-small", "移除");
-    remove.type = "button";
-    remove.disabled = !targetId(target);
-    remove.addEventListener("click", () => deleteTarget(target));
-    item.append(info, remove);
-    dom.targetsContainer.append(item);
-  }
-}
-
 function createCheckboxGrid(options, selectedValues, onChange) {
   const selected = new Set(selectedValues);
   const grid = createElement("div", "checkbox-grid");
@@ -433,7 +404,6 @@ function createCheckboxGrid(options, selectedValues, onChange) {
       if (checkbox.checked) selected.add(value);
       else selected.delete(value);
       onChange(Array.from(selected));
-      markChanged();
     });
     wrapper.append(checkbox, createElement("span", "", label));
     grid.append(wrapper);
@@ -472,76 +442,39 @@ function createTimeList(subscription) {
   return container;
 }
 
-function renderRule(subscription, index) {
-  const item = createElement("article", "rule-item");
-  item.dataset.subscriptionId = subscription.id;
-
-  const header = createElement("div", "rule-header");
-  header.append(createElement("span", "rule-index", `#${index + 1}`));
-
-  const targetField = createElement("label", "field");
-  targetField.append(createElement("span", "", "發送群組"));
-  const targetSelect = document.createElement("select");
-  const emptyOption = document.createElement("option");
-  emptyOption.value = "";
-  emptyOption.textContent = "選擇已登記群組";
-  targetSelect.append(emptyOption);
-  if (subscription.target_umo && !findTargetByUmo(subscription.target_umo)) {
-    const retainedOption = document.createElement("option");
-    retainedOption.value = subscription.target_umo;
-    retainedOption.textContent = "已取消登記（規則保留）";
-    targetSelect.append(retainedOption);
-  }
-  state.targets.forEach((target) => {
-    targetSelect.append(createTargetOption(target, subscription.target_umo));
-  });
-  targetSelect.value = subscription.target_umo;
-  targetSelect.addEventListener("change", () => {
-    subscription.target_umo = targetSelect.value;
-    markChanged();
-  });
-  targetField.append(targetSelect);
-  header.append(targetField);
-
+function renderRule(subscription, target, onChange) {
+  const body = createElement("div", "rule-body");
+  const header = createElement("div", "rule-toolbar");
   const enabledField = createElement("label", "field field-inline");
-  enabledField.append(createElement("span", "", "啟用"));
+  enabledField.append(createElement("span", "", "啟用本群組播報"));
   const enabledInput = document.createElement("input");
   enabledInput.type = "checkbox";
   enabledInput.checked = subscription.enabled;
   enabledInput.role = "switch";
   enabledInput.addEventListener("change", () => {
     subscription.enabled = enabledInput.checked;
-    markChanged();
+    onChange();
   });
   enabledField.append(enabledInput);
   header.append(enabledField);
 
-  const removeButton = createElement("button", "button button-quiet-danger button-small", "刪除規則");
+  const removeButton = createElement("button", "button button-quiet-danger button-small", "移除群組");
   removeButton.type = "button";
-  removeButton.addEventListener("click", async () => {
-    const accepted = await requestConfirmation(
-      "刪除播報規則",
-      `確定刪除「${targetLabel(findTargetByUmo(subscription.target_umo))}」的播報規則？`,
-      "刪除",
-    );
-    if (!accepted) return;
-    state.settings.subscriptions.splice(index, 1);
-    markChanged(true);
-  });
+  removeButton.addEventListener("click", () => deleteTarget(target));
   header.append(removeButton);
 
-  const body = createElement("div", "rule-body");
+  body.append(header);
 
   const citiesSection = createElement("section", "rule-section");
   const citiesHeading = createElement("div", "rule-section-heading");
   citiesHeading.append(
-    createElement("span", "", "天氣縣市"),
-    createElement("span", "", `${subscription.cities.length} 個`),
+    createElement("span", "", "縣市（定時天氣與地方警報）"),
   );
   citiesSection.append(citiesHeading);
   citiesSection.append(
     createCheckboxGrid(state.cityOptions, subscription.cities, (values) => {
       subscription.cities = values;
+      onChange();
     }),
   );
   body.append(citiesSection);
@@ -550,15 +483,26 @@ function renderRule(subscription, index) {
   const alertsHeading = createElement("div", "rule-section-heading");
   alertsHeading.append(
     createElement("span", "", "災害與警特報"),
-    createElement("span", "", `${subscription.alert_types.length} 種`),
   );
   alertsSection.append(alertsHeading);
   alertsSection.append(
     createCheckboxGrid(state.alertOptions, subscription.alert_types, (values) => {
       subscription.alert_types = values;
+      onChange();
     }),
   );
   body.append(alertsSection);
+
+  const mediaSection = createElement("section", "rule-section");
+  mediaSection.append(
+    createElement("div", "rule-section-heading", "官方圖資（隨對應的災害警報傳送）"),
+    createCheckboxGrid(state.mediaOptions, subscription.media_types, (values) => {
+      subscription.media_types = values;
+      onChange();
+    }),
+  );
+  mediaSection.classList.add("media-options");
+  body.append(mediaSection);
 
   const forecastSection = createElement("section", "rule-section");
   const forecastHeading = createElement("div", "rule-section-heading");
@@ -573,7 +517,7 @@ function renderRule(subscription, index) {
   addTimeButton.addEventListener("click", () => {
     if (subscription.forecast_times.length >= 4) return;
     subscription.forecast_times.push("07:30");
-    markChanged(true);
+    onChange(true);
   });
   forecastHeading.append(forecastToggle, addTimeButton);
   forecastSection.append(forecastHeading, createTimeList(subscription));
@@ -582,7 +526,7 @@ function renderRule(subscription, index) {
     if (subscription.forecast_enabled && subscription.forecast_times.length === 0) {
       subscription.forecast_times.push("07:30");
     }
-    markChanged(true);
+    onChange(true);
   });
   body.append(forecastSection);
 
@@ -595,43 +539,129 @@ function renderRule(subscription, index) {
   alertsPreview.addEventListener("click", () => previewSubscription(subscription, "alerts"));
   const testSend = createElement("button", "button button-primary button-small", "測試發送");
   testSend.type = "button";
-  const selectedTarget = findTargetByUmo(subscription.target_umo);
-  testSend.disabled =
-    !selectedTarget || !targetId(selectedTarget) || selectedTarget.available === false;
+  testSend.disabled = !targetId(target) || target.available === false;
   testSend.addEventListener("click", () => sendTest(subscription));
   actions.append(weatherPreview, alertsPreview, testSend);
   body.append(actions);
 
-  item.append(header, body);
-  return item;
+  return body;
 }
 
 function renderRules() {
   dom.rulesContainer.replaceChildren();
   const subscriptions = state.settings?.subscriptions || [];
-  dom.rulesSummary.textContent = `${subscriptions.length} 筆`;
-  dom.subscriptionCount.textContent = String(
-    subscriptions.filter((subscription) => subscription.enabled).length,
-  );
-
-  if (subscriptions.length === 0) {
-    dom.rulesContainer.append(emptyState("尚無播報規則"));
+  const rules = new Map(subscriptions.map((rule) => [rule.target_umo, rule]));
+  const search = dom.groupSearch.value.trim().toLowerCase();
+  const filter = dom.groupFilter.value;
+  const matches = state.targets.filter((target) => {
+    const enabled = rules.get(target.target_umo)?.enabled;
+    return (!filter || (filter === "enabled") === Boolean(enabled)) &&
+      [targetLabel(target), target.group_id, target.platform_type, target.platform_id]
+        .some((value) => String(value || "").toLowerCase().includes(search));
+  });
+  dom.rulesSummary.textContent = `${matches.length}／${state.targets.length} 個群組`;
+  const page = listPage("group", matches, 12);
+  if (page.length === 0) {
+    dom.rulesContainer.append(emptyState(
+      state.targets.length ? "找不到符合條件的群組" : "請先在群組內輸入 /cwa_register",
+    ));
     return;
   }
 
-  subscriptions.forEach((subscription, index) => {
-    dom.rulesContainer.append(renderRule(subscription, index));
-  });
+  for (const target of page) {
+    const umo = target.target_umo;
+    const rule = rules.get(umo) || defaultSubscription(target);
+    const item = createElement("details", "rule-item");
+    item.name = "broadcast-groups";
+    const summary = createElement("summary", "group-summary");
+    const info = createElement("div", "group-info");
+    const meta = createElement("div", "metadata-text");
+    info.append(createElement("div", "target-name", targetLabel(target)), meta);
+    const badge = createElement("span", "status-pill");
+    badge.title = String(target.availability_message || "");
+    const updateSummary = () => {
+      meta.textContent = [
+        target.platform_type || target.platform_id,
+        target.group_id,
+        ...rule.cities.slice(0, 2),
+        rule.cities.length > 2 ? `等 ${rule.cities.length} 縣市` : "",
+        rule.alert_types.length ? `${rule.alert_types.length} 種警報` : "",
+        rule.media_types.length ? `${rule.media_types.length} 種圖資` : "",
+      ].filter(Boolean).join(" · ");
+      if (target.available === false) {
+        setStatusPill(badge, "平台不可用", "warning");
+      } else {
+        setStatusPill(badge, rule.enabled ? "已啟用" : "未啟用", rule.enabled ? "success" : "neutral");
+      }
+    };
+    updateSummary();
+    summary.append(info, badge);
+    item.append(summary);
+    const showEditor = () => {
+      if (item.children.length > 1) return;
+      item.append(renderRule(rule, target, (rerender = false) => {
+        if (!rules.has(umo)) {
+          rules.set(umo, rule);
+          state.settings.subscriptions.push(rule);
+        }
+        updateSummary();
+        markChanged(rerender);
+      }));
+    };
+    if (state.openGroup === umo) {
+      item.open = true;
+      showEditor();
+    }
+    item.addEventListener("toggle", () => {
+      if (!item.isConnected) return;
+      if (item.open) {
+        state.openGroup = umo;
+        showEditor();
+        for (const other of dom.rulesContainer.querySelectorAll("details[open]")) {
+          if (other !== item) other.open = false;
+        }
+      } else if (state.openGroup === umo) {
+        state.openGroup = "";
+      }
+    });
+    dom.rulesContainer.append(item);
+  }
+}
+
+function listPage(name, items, size) {
+  const key = `${name}Page`;
+  const pages = Math.max(1, Math.ceil(items.length / size));
+  state[key] = Math.max(0, Math.min(state[key], pages - 1));
+  const index = state[key];
+  document.getElementById(`${name}-pagination`).hidden = pages === 1;
+  document.getElementById(`${name}-page-label`).textContent = `${index + 1}／${pages} 頁`;
+  document.getElementById(`${name}-previous`).disabled = index === 0;
+  document.getElementById(`${name}-next`).disabled = index >= pages - 1;
+  return items.slice(index * size, (index + 1) * size);
 }
 
 function renderDelivery() {
   dom.deliveryBody.replaceChildren();
-  const records = state.deliveryStatus.slice(0, 50);
-  dom.deliverySummary.textContent = records.length ? `${records.length} 筆` : "尚無紀錄";
+  const kind = dom.deliveryKind.value;
+  const matches = state.deliveryStatus.filter((record) => {
+    const media = record.part !== "text";
+    const type = media ? "media" : record.kind || (
+      record.event_fingerprint?.startsWith("forecast:") ? "weather" : "alerts"
+    );
+    const groupMatches = !dom.deliveryGroup.value || record.target_umo === dom.deliveryGroup.value;
+    const statusMatches = !dom.deliveryFilter.value || record.status === dom.deliveryFilter.value;
+    const kindMatches = !kind || type === kind ||
+      (kind === "alerts" && !["media", "weather", "test"].includes(type));
+    return groupMatches && statusMatches && kindMatches;
+  });
+  const records = listPage("delivery", matches, 12);
+  dom.deliverySummary.textContent = `${matches.length}／${state.deliveryStatus.length} 筆`;
 
   if (records.length === 0) {
     const row = document.createElement("tr");
-    const cell = createElement("td", "empty-state", "尚無投遞紀錄");
+    const cell = createElement(
+      "td", "empty-state", state.deliveryStatus.length ? "沒有符合條件的傳送紀錄" : "尚無傳送紀錄",
+    );
     cell.colSpan = 6;
     row.append(cell);
     dom.deliveryBody.append(row);
@@ -645,16 +675,64 @@ function renderDelivery() {
     const statusClass = record.status === "success" ? "status-success" : "status-danger";
     const statusCell = document.createElement("td");
     statusCell.append(createElement("span", `status-pill ${statusClass}`, status));
+    const details = createElement("td");
+    const open = createElement("button", "button button-secondary button-small", "查看");
+    open.type = "button";
+    open.addEventListener("click", () => viewDelivery(record, target));
+    details.append(open);
+    const label = record.title ||
+      (record.part === "image" ? "颱風警報單" : record.part === "text" ? "文字播報" : "官方圖資");
     row.append(
-      createElement("td", "", formatTime(record.delivered_at || record.last_attempt_at)),
+      createElement("td", "", formatTime(record.last_attempt_at || record.delivered_at)),
       createElement("td", "", target ? targetLabel(target) : record.target_umo || "--"),
-      createElement("td", "", record.part === "image" ? "圖片" : "文字"),
+      createElement("td", "delivery-title", label),
       statusCell,
       createElement("td", "", String(record.attempts || 0)),
-      createElement("td", "cell-error", record.error || ""),
+      details,
     );
     dom.deliveryBody.append(row);
   });
+}
+
+async function viewDelivery(record, target) {
+  dom.previewTitle.textContent = record.title || "傳送紀錄";
+  dom.previewMeta.textContent = [
+    target ? targetLabel(target) : record.target_umo, formatTime(record.last_attempt_at),
+  ].join(" · ");
+  dom.previewContent.replaceChildren(emptyState("載入中…"));
+  dom.previewDialog.showModal();
+  try {
+    const result = await apiPost("delivery/detail", { id: record.id });
+    if (!result?.record) throw new Error(result?.message || "無法讀取傳送紀錄");
+    const detail = result.record;
+    const snapshot = detail.content;
+    dom.previewContent.replaceChildren();
+    if (detail.error) {
+      dom.previewContent.append(createElement("p", "cell-error", detail.error));
+    }
+    if (!snapshot) {
+      dom.previewContent.append(emptyState("此紀錄尚未保存訊息內容。"));
+      return;
+    }
+    const chunks = asArray(snapshot.chunks);
+    const accepted = detail.status === "success" ? chunks.length : (snapshot.accepted || 0);
+    if (snapshot.media_name) {
+      const label = detail.status === "success" ? "已交付附件" : "嘗試傳送的附件";
+      dom.previewContent.append(createElement("p", "", `${label}：${snapshot.media_name}`));
+    }
+    if (!chunks.length && !snapshot.media_name) {
+      dom.previewContent.append(emptyState("沒有可預覽的傳送內容。"));
+    }
+    chunks.forEach((chunk, index) => {
+      if (detail.status !== "success" || chunks.length > 1) {
+        const status = index < accepted ? "已交付平台" : "尚未交付";
+        dom.previewContent.append(createElement("p", "metadata-text", `第 ${index + 1} 段 · ${status}`));
+      }
+      dom.previewContent.append(createElement("pre", "preview-message", chunk));
+    });
+  } catch (error) {
+    dom.previewContent.replaceChildren(emptyState(error?.message || String(error)));
+  }
 }
 
 function markChanged(rerender = false) {
@@ -675,6 +753,7 @@ function buildSettingsPayload() {
       new Set(subscription.forecast_times.filter((value) => /^\d{2}:\d{2}$/.test(value))),
     ).slice(0, 4),
     alert_types: Array.from(new Set(subscription.alert_types)),
+    media_types: Array.from(new Set(subscription.media_types)),
   }));
 
   const payload = {
@@ -701,22 +780,23 @@ function validateSettings(payload) {
 
   const registeredUmos = new Set(state.targets.map((target) => target.target_umo));
   const selectedUmos = new Set();
-  for (const [index, subscription] of payload.subscriptions.entries()) {
-    if (!subscription.target_umo || !registeredUmos.has(subscription.target_umo)) {
-      return `第 ${index + 1} 筆規則尚未選擇有效的已登記群組。`;
+  for (const subscription of payload.subscriptions) {
+    const label = targetLabel(findTargetByUmo(subscription.target_umo));
+    if (!subscription.target_umo || (subscription.enabled && !registeredUmos.has(subscription.target_umo))) {
+      return `「${label}」尚未登記。`;
     }
     if (selectedUmos.has(subscription.target_umo)) {
       return `「${targetLabel(findTargetByUmo(subscription.target_umo))}」有重複規則。`;
     }
     selectedUmos.add(subscription.target_umo);
     if (subscription.forecast_enabled && subscription.cities.length === 0) {
-      return `第 ${index + 1} 筆規則已啟用定時天氣，但未選擇縣市。`;
+      return `請為「${label}」選擇定時天氣的縣市。`;
     }
     if (subscription.forecast_enabled && subscription.forecast_times.length === 0) {
-      return `第 ${index + 1} 筆規則已啟用定時天氣，但未設定播報時刻。`;
+      return `請為「${label}」設定定時天氣的時刻。`;
     }
-    if (subscription.alert_types.length === 0 && !subscription.forecast_enabled) {
-      return `第 ${index + 1} 筆規則沒有可播報的內容。`;
+    if (subscription.enabled && subscription.alert_types.length === 0 && !subscription.forecast_enabled) {
+      return `請為「${label}」選擇播報內容。`;
     }
   }
   return "";
@@ -852,9 +932,12 @@ async function sendTest(subscription) {
 
   try {
     const result = await apiPost("test-send", { target_id: targetId(target) });
-    if (result?.ok === false) throw new Error(result.message || "發送失敗");
+    if (result?.ok === false) {
+      if (!state.dirty) await loadState(true);
+      throw new Error(result.message || "發送失敗");
+    }
     showToast(`${result?.message || "測試訊息已發送"} · ${formatTime(result?.sent_at)}`);
-    await loadState(true);
+    if (!state.dirty) await loadState(true);
   } catch (error) {
     showToast(`測試發送失敗：${error?.message || error}`);
   }
@@ -894,25 +977,35 @@ async function deleteTarget(target) {
   }
 }
 
-function addRule() {
-  const used = new Set(
-    state.settings.subscriptions.map((subscription) => subscription.target_umo),
-  );
-  const target = state.targets.find((candidate) => !used.has(candidate.target_umo));
-  if (!target) {
-    showToast("所有已登記群組都已有播報規則");
-    return;
-  }
-  state.settings.subscriptions.push(defaultSubscription(target));
-  markChanged(true);
-}
-
 function bindEvents() {
   dom.refreshButton.addEventListener("click", () => loadState(false));
   dom.saveButton.addEventListener("click", saveSettings);
-  dom.addRuleButton.addEventListener("click", addRule);
   dom.sourceTestButton.addEventListener("click", testSource);
   dom.previewClose.addEventListener("click", () => dom.previewDialog.close());
+  dom.groupSearch.addEventListener("input", () => {
+    state.groupPage = 0;
+    renderRules();
+  });
+  dom.groupFilter.addEventListener("change", () => {
+    state.groupPage = 0;
+    renderRules();
+  });
+  for (const filter of [dom.deliveryGroup, dom.deliveryFilter, dom.deliveryKind]) {
+    filter.addEventListener("change", () => {
+      state.deliveryPage = 0;
+      renderDelivery();
+    });
+  }
+  for (const [name, render] of [["group", renderRules], ["delivery", renderDelivery]]) {
+    document.getElementById(`${name}-previous`).addEventListener("click", () => {
+      state[`${name}Page`] -= 1;
+      render();
+    });
+    document.getElementById(`${name}-next`).addEventListener("click", () => {
+      state[`${name}Page`] += 1;
+      render();
+    });
+  }
 
   [
     dom.enabledInput,
